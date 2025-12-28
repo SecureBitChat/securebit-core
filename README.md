@@ -12,9 +12,26 @@
 
 ---
 
+##  Now Available: Desktop Applications!
+
+**SecureBit Chat desktop applications are now available for Windows, macOS, and Linux!**
+
+Download native desktop apps built on this secure core:
+
+[![Download Desktop Apps](https://img.shields.io/badge/Download-Desktop%20Apps-blue?style=for-the-badge&logo=github)](https://github.com/SecureBitChat/securebit-desktop)
+
+### Desktop Releases
+- **Windows 10/11** - NSIS Installer
+- **macOS 11+** - Universal App (Intel + Apple Silicon)
+- **Linux** - AppImage (Universal)
+
+**[Get Desktop Apps →](https://github.com/SecureBitChat/securebit-desktop)**
+
+---
+
 ## Features
 
-### 🔐 Cryptographic Security
+### Cryptographic Security
 
 - **ECDH Key Exchange (P-384)**: Ephemeral key exchange with perfect forward secrecy
 - **ECDSA Signatures (P-384)**: Cryptographic authentication of protocol messages
@@ -23,7 +40,7 @@
 - **HMAC-SHA-256**: Message authentication codes for integrity verification
 - **SAS (Short Authentication String)**: MITM detection via DTLS fingerprint verification
 
-### 🛡️ Protocol Security
+### Protocol Security
 
 - **Protocol Version Enforcement**: Strict validation of protocol version (v4.0)
 - **Message Structure Validation**: All protocol messages are validated before processing
@@ -31,19 +48,43 @@
 - **Replay Protection**: Sequence numbers prevent message replay attacks
 - **Metadata Protection**: Message metadata (timestamps, IDs) are encrypted separately
 
-### 🌐 Platform Independence
+### Platform Independence
 
 - **Zero Platform Dependencies**: No Tauri, no UI frameworks, no OS-specific APIs
 - **Cross-Platform**: Works on Windows, macOS, Linux, Android, iOS
 - **Headless Support**: Can be used in CLI tools, daemons, and background services
 - **Thread-Safe**: Uses `Arc<Mutex<>>` for thread-safe state management
 
-### 🔍 Security Transparency
+### Security Transparency
 
 - **Public Core**: All security-critical code is in this public repository
 - **Auditable**: Designed for independent security review
 - **No Backdoors**: Zero external network calls, zero file system access
 - **Deterministic**: Same inputs produce the same security-relevant outputs
+
+---
+
+## Official Applications
+
+SecureBit Core powers multiple official applications:
+
+### Desktop Applications
+**Native desktop apps for Windows, macOS, and Linux**
+- Repository: [securebit-desktop](https://github.com/SecureBitChat/securebit-desktop)
+- Platforms: Windows 10/11, macOS 11+, Linux (AppImage)
+- Status: Public Beta v0.1.0 Available
+- License: Proprietary (free for personal & commercial use)
+
+### Web Application
+**Browser-based secure chat (fully open source)**
+- Repository: [securebit-chat](https://github.com/SecureBitChat/securebit-chat)
+- Platforms: All modern browsers
+- Status: Production Ready
+- License: MIT
+
+### Coming Soon
+- **Mobile Apps** (iOS/Android) - Q2 2026
+- **Store Distribution** (Windows Store, Mac App Store, Snap Store) - Q1 2026
 
 ---
 
@@ -92,7 +133,7 @@ let encrypted = core.encrypt_enhanced_message(
 let decrypted = core.decrypt_enhanced_message(encrypted)?;
 ```
 
-### Integration with Tauri
+### Integration with Tauri (Desktop Apps)
 
 ```rust
 use securebit_core::Core;
@@ -160,11 +201,11 @@ All state is thread-safe via `Arc<Mutex<>>` and is never persisted to disk.
 
 ### What the Core Guarantees
 
-- ✅ **Cryptographic Security**: ECDH, ECDSA, HKDF, AES-GCM, HMAC
-- ✅ **Protocol Security**: Version enforcement, message validation, state machine
-- ✅ **Key Management**: Ephemeral keys, secure derivation, key isolation
-- ✅ **SAS Security**: Deterministic SAS computation for MITM detection
-- ✅ **Input Validation**: Strict validation of all inputs
+- **Cryptographic Security**: ECDH, ECDSA, HKDF, AES-GCM, HMAC
+- **Protocol Security**: Version enforcement, message validation, state machine
+- **Key Management**: Ephemeral keys, secure derivation, key isolation
+- **SAS Security**: Deterministic SAS computation for MITM detection
+- **Input Validation**: Strict validation of all inputs
 
 ### What the Core Does NOT Guarantee
 
@@ -182,12 +223,12 @@ See [SECURITY_MODEL.md](SECURITY_MODEL.md) for detailed security guarantees.
 
 ### Threats Mitigated
 
-- ✅ **MITM Attacks**: ECDH key exchange, ECDSA signatures, SAS verification
-- ✅ **Eavesdropping**: AES-256-GCM encryption with ephemeral keys
-- ✅ **Message Tampering**: HMAC-SHA-256, AES-GCM authentication
-- ✅ **Replay Attacks**: Sequence numbers, timestamp validation
-- ✅ **Perfect Forward Secrecy**: Ephemeral ECDH keys
-- ✅ **Protocol Attacks**: Version enforcement, message validation
+- **MITM Attacks**: ECDH key exchange, ECDSA signatures, SAS verification
+- **Eavesdropping**: AES-256-GCM encryption with ephemeral keys
+- **Message Tampering**: HMAC-SHA-256, AES-GCM authentication
+- **Replay Attacks**: Sequence numbers, timestamp validation
+- **Perfect Forward Secrecy**: Ephemeral ECDH keys
+- **Protocol Attacks**: Version enforcement, message validation
 
 ### Threats NOT Mitigated
 
@@ -279,16 +320,32 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for detailed threat analysis.
 
 ---
 
+## Use Cases
+
+### Production Applications
+
+This core is used in production by:
+
+1. **[SecureBit Desktop](https://github.com/SecureBitChat/securebit-desktop)** - Native desktop applications
+2. **[SecureBit Web](https://github.com/SecureBitChat/securebit-chat)** - Browser-based chat application
+
+### Your Own Applications
+
+You can integrate this core into:
+-  **Desktop Applications** (Tauri, Electron, Qt)
+-  **Mobile Applications** (React Native, Flutter, native iOS/Android)
+-  **Web Applications** (WASM, JavaScript bindings)
+-  **CLI Tools** (Headless bots, automation)
+-  **Backend Services** (Message relays, bridge services)
+
+---
+
 ## Security Audit
 
 This crate has been audited for public security review. See:
 
 - [SECURITY_MODEL.md](SECURITY_MODEL.md) - Security guarantees and boundaries
 - [THREAT_MODEL.md](THREAT_MODEL.md) - Threat analysis
-
-**Audit Status**: ✅ **APPROVED FOR PUBLIC PUBLICATION**
-
-**Code Quality**: ✅ **Zero warnings, zero errors, all tests passing**
 
 **License**: Apache-2.0
 
@@ -304,6 +361,16 @@ This is a security-critical crate. All contributions must:
 4. Include tests for new functionality
 5. Update documentation (README, SECURITY_MODEL, THREAT_MODEL)
 
+### How to Contribute
+
+1. **Report Security Issues**: Email security@securebit.chat (PGP key available)
+2. **Submit Bug Reports**: Open an issue on GitHub
+3. **Propose Features**: Open a discussion on GitHub
+4. **Submit Pull Requests**: Follow our contribution guidelines
+5. **Improve Documentation**: Help make docs clearer
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
+
 ---
 
 ## License
@@ -312,6 +379,43 @@ This project is licensed under the Apache License, Version 2.0 - see the [LICENS
 
 **SPDX-License-Identifier**: Apache-2.0
 
+### Why Apache 2.0?
+
+We chose Apache License 2.0 because it:
+-  Provides explicit patent protection
+-  Allows commercial use without restrictions
+-  Protects contributors from patent claims
+-  Is compatible with most other licenses
+-  Is trusted by enterprise users
+
+---
+
+## Roadmap
+
+### Current Version (v0.1.0)
+-  Core cryptographic primitives
+-  P2P protocol implementation
+-  Desktop application support
+-  Web application support
+
+### Q1 2026
+-  Mobile FFI bindings (iOS/Android)
+-  WASM support for web
+-  Performance optimizations
+-  Additional test coverage
+
+### Q2 2026
+-  Post-quantum cryptography (CRYSTALS-Kyber)
+-  Multi-device sync protocol
+-  Group chat cryptography
+-  Hardware security module support
+
+### Q3 2026
+-  Formal verification (selected modules)
+-  Side-channel resistance improvements
+-  Memory-hard key derivation
+-  Advanced metadata protection
+
 ---
 
 ## Acknowledgments
@@ -319,18 +423,85 @@ This project is licensed under the Apache License, Version 2.0 - see the [LICENS
 - Built with Rust's excellent cryptographic ecosystem
 - Designed for independent security review and white-label distribution
 - Inspired by Signal Protocol and OTR (Off-the-Record) messaging
+- Thanks to all contributors and security researchers
+
+### Special Thanks
+
+- **Rust Crypto Team**: For excellent cryptographic primitives
+- **Tauri Team**: For the desktop application framework
+- **WebRTC Community**: For peer-to-peer technology
+- **Security Researchers**: For audits and feedback
 
 ---
 
-## Support
+## Related Projects
 
-For security issues, please contact the maintainers directly or open an issue on the repository.
+### Official SecureBit Applications
+- **[Desktop Apps](https://github.com/SecureBitChat/securebit-desktop)** - Windows, macOS, Linux
+- **[Web App](https://github.com/SecureBitChat/securebit-chat)** - Browser-based chat
 
-For general questions, please open an issue on the repository.
+### Cryptographic Libraries
+- [RustCrypto](https://github.com/RustCrypto) - Cryptographic algorithms in Rust
+- [ring](https://github.com/briansmith/ring) - Safe, fast crypto using Rust & BoringSSL
+- [sodiumoxide](https://github.com/sodiumoxide/sodiumoxide) - Rust bindings to libsodium
+
+---
+
+## FAQs
+
+### Why is the core open source but desktop apps proprietary?
+
+The **security-critical code** (all cryptography, protocol implementation) is 100% open source in this repository. The desktop applications are proprietary wrappers around this core, containing only UI code and platform integrations. This means:
+- You can audit all security-critical operations
+- No cryptographic operations happen in closed-source code
+- Business sustainability through proprietary UI
+- Open core enables trust and transparency
+
+### Can I use this core in my own application?
+
+Yes! This core is licensed under Apache 2.0, which allows:
+- Commercial use
+- Modification and distribution
+- Private use
+- Patent grant
+
+Just make sure to include the license and copyright notice.
+
+### Is this production-ready?
+
+Yes! This core is used in production by:
+- SecureBit Desktop (public beta)
+- SecureBit Web (production)
+
+However, we recommend:
+- Independent security audit for critical applications
+- Thorough testing in your specific use case
+- Performance testing under expected load
+
+### How do I report security vulnerabilities?
+
+**Please DO NOT open public issues for security vulnerabilities.**
+
+Instead:
+1. Email: security@securebit.chat
+2. Include: Detailed description, reproduction steps, impact assessment
+3. Expect: Response within 24 hours
+4. We follow: Responsible disclosure (90-day window)
 
 ---
 
 **Version**: 0.1.0  
 **License**: Apache-2.0  
-**Last Updated**: 2025-12-23
+**Last Updated**: December 28, 2025
 
+---
+
+<div align="center">
+
+**Built for Security, Designed for Transparency**
+
+[Desktop Apps](https://github.com/SecureBitChat/securebit-desktop) • [Web App](https://github.com/SecureBitChat/securebit-chat) • [Security Model](SECURITY_MODEL.md) • [Threat Model](THREAT_MODEL.md)
+
+**Made with 🦀 by the SecureBit Team**
+
+</div>
