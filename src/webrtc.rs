@@ -61,8 +61,10 @@ pub fn create_secure_offer(offer_state: Arc<Mutex<OfferContext>>, offer_sdp: Opt
         .collect::<Result<Vec<_>, _>>()?
         .join(":");
     
-    // Store hex fingerprint (without colons) for SAS computation
-    let local_dtls_fp_hex = fp_hex.clone();
+    // NOTE: `fp_hex` above is only the synthetic fingerprint used to fill the
+    // minimal fallback SDP. The fingerprint used for SAS is taken from the SDP we
+    // actually advertise (see `local_dtls_fp_hex` below) so it matches what the
+    // peer derives from that same SDP.
 
     // Use provided real SDP if available; otherwise fall back to minimal SDP
     let minimal_sdp = format!(
@@ -85,7 +87,14 @@ pub fn create_secure_offer(offer_state: Arc<Mutex<OfferContext>>, offer_sdp: Opt
         ice_pwd,
         fp_colon
     );
-    
+
+    // The SDP we will actually advertise in the offer ("s"). Extract the REAL DTLS
+    // fingerprint from it for SAS, so both peers derive the SAS from the same
+    // fingerprint. Fall back to the synthetic one only if the SDP carries none.
+    let effective_offer_sdp = offer_sdp.unwrap_or_else(|| minimal_sdp.clone());
+    let local_dtls_fp_hex = extract_dtls_fingerprint_from_sdp(&effective_offer_sdp)
+        .unwrap_or_else(|| fp_hex.to_lowercase());
+
     // Export SPKI for both keys
     let ecdh_spki_der = ecdh_public.to_public_key_der().map_err(|e| CoreError::crypto_failure(format!("ECDH key export failed: {}", e)))?;
     let ecdsa_spki_der = ecdsa_public.to_public_key_der().map_err(|e| CoreError::crypto_failure(format!("ECDSA key export failed: {}", e)))?;
@@ -121,23 +130,25 @@ pub fn create_secure_offer(offer_state: Arc<Mutex<OfferContext>>, offer_sdp: Opt
     let offer_package = serde_json::json!({
         // Core information (minimal)
         "t": "offer", // type
-        "s": offer_sdp.unwrap_or_else(|| minimal_sdp.clone()), // actual SDP from WebRTC offer
-        "v": "4.0", // version
+        "s": effective_offer_sdp, // actual SDP from WebRTC offer (real DTLS fingerprint)
+        "v": "4.1", // protocol version (web PROTOCOL_VERSION); key-package version stays 4.0
         "ts": chrono::Utc::now().timestamp_millis(), // timestamp
         
         // Cryptographic keys (essential)
+        // The web verifier reconstructs the signed string from ALL fields except
+        // "signature" (in insertion order), so this object must contain exactly
+        // {keyType, keyData, timestamp, version, signature} — no extra "ps" field.
         "e": { // signed ECDH public key package
             "keyType": "ECDH",
             "keyData": ecdh_spki_der.as_bytes(),
             "timestamp": e_ts,
             "version": "4.0",
-            "signature": e_sig_raw.as_ref(),
-            "ps": e_core_str
+            "signature": e_sig_raw.as_ref()
         },
         "d": { // ECDSA public key (raw SPKI)
             "keyData": ecdsa_spki_der.as_bytes()
         },
-        
+
         // Session data (essential)
         "sl": session_salt.to_vec(), // salt
         "si": session_id, // sessionId
@@ -221,16 +232,16 @@ pub fn create_secure_answer(
         return Err(CoreError::protocol_violation("Invalid offer type"));
     }
     
-    if offer["v"].as_str() != Some("4.0") {
+    if offer["v"].as_str() != Some("4.1") {
         return Err(CoreError::protocol_violation("Unsupported protocol version"));
     }
-    
+
     // Generate P-384 keys for answer
     let ecdh_secret = P384Secret::random(&mut rand::thread_rng());
     let ecdh_public = P384Pub::from(&ecdh_secret);
     let ecdsa_signing = SigningKey::random(&mut rand::thread_rng());
     let ecdsa_public = ecdsa_signing.verifying_key();
-    
+
     // Generate our session salt
     let mut our_session_salt = [0u8; 64];
     rand::thread_rng().fill(&mut our_session_salt);
@@ -330,7 +341,7 @@ pub fn create_secure_answer(
         // Core information (minimal)
         "t": "answer", // type
         "s": answer_sdp.unwrap_or(minimal_answer_sdp), // actual WebRTC answer SDP (fallback to minimal)
-        "v": "4.0", // version
+        "v": "4.1", // protocol version (web PROTOCOL_VERSION); key-package version stays 4.0
         "ts": chrono::Utc::now().timestamp_millis(), // timestamp
         
         // Reference to original offer
@@ -518,8 +529,11 @@ fn extract_dtls_fingerprint_from_sdp(sdp: &str) -> Option<String> {
     let fingerprint_regex = regex::Regex::new(r"a=fingerprint:sha-256\s+([A-Fa-f0-9:]+)").ok()?;
     if let Some(caps) = fingerprint_regex.captures(sdp) {
         if let Some(fp_match) = caps.get(1) {
-            // Remove colons and convert to lowercase (for consistency)
-            let fp = fp_match.as_str().replace(":", "").to_lowercase();
+            // Keep colons, lowercase only — this MUST match the web's _computeSAS
+            // normalization (`fingerprint.trim().toLowerCase()`), which preserves
+            // the colon-separated form. Stripping colons would change the SAS salt
+            // and make the codes disagree across implementations.
+            let fp = fp_match.as_str().trim().to_lowercase();
             return Some(fp);
         }
     }
@@ -699,7 +713,7 @@ pub fn join_secure_connection(
     
     let offer_version = offer.get("v").or_else(|| offer.get("version"));
     
-    if offer_version.and_then(|v| v.as_str()) != Some("4.0") {
+    if offer_version.and_then(|v| v.as_str()) != Some("4.1") {
         return Err(CoreError::protocol_violation("Unsupported protocol version"));
     }
     
@@ -805,7 +819,19 @@ pub fn join_secure_connection(
     // Then: const packageString = JSON.stringify(keyPackage);
     let e_ts = chrono::Utc::now().timestamp_millis();
     
-    // Create object in the exact same order as web version
+    // Build the signed key-package string MANUALLY in keyType-first order, exactly
+    // like create_secure_offer and the web's JSON.stringify({keyType,keyData,timestamp,version}).
+    // serde_json::Map serializes keys alphabetically, which would NOT match the web
+    // verifier, so the signed string must not be derived from the map.
+    let e_key_data_str = format!("[{}]", ecdh_spki_der.as_bytes().iter()
+        .map(|b| b.to_string()).collect::<Vec<_>>().join(","));
+    let e_core_str = format!(
+        r#"{{"keyType":"ECDH","keyData":{},"timestamp":{},"version":"4.0"}}"#,
+        e_key_data_str, e_ts
+    );
+
+    // Field map used only to assemble the answer "e" object. We also embed the
+    // signed "ps" string so the peer can verify against the exact bytes we signed.
     let mut ecdh_key_package = serde_json::Map::new();
     ecdh_key_package.insert("keyType".to_string(), serde_json::Value::String("ECDH".to_string()));
     ecdh_key_package.insert("keyData".to_string(), serde_json::Value::Array(
@@ -813,11 +839,9 @@ pub fn join_secure_connection(
     ));
     ecdh_key_package.insert("timestamp".to_string(), serde_json::Value::Number(e_ts.into()));
     ecdh_key_package.insert("version".to_string(), serde_json::Value::String("4.0".to_string()));
-    
-    // Serialize to JSON string exactly like web version's JSON.stringify
-    let e_core_str = serde_json::to_string(&serde_json::Value::Object(ecdh_key_package.clone()))
-        .map_err(|e| CoreError::internal_error(format!("Failed to serialize ECDH package: {}", e)))?;
-    
+    // No "ps" field: the web verifier includes every non-signature field in the
+    // signed string, so the package must be exactly {keyType,keyData,timestamp,version,signature}.
+
     let mut ecdh_hasher = Sha384::new();
     ecdh_hasher.update(e_core_str.as_bytes());
     let ecdh_digest = ecdh_hasher.finalize();
@@ -874,8 +898,8 @@ pub fn join_secure_connection(
     let answer_package = serde_json::json!({
         "t": "answer",
         "s": answer_sdp.unwrap_or(minimal_answer_sdp),
-        "v": "4.0",
-        "version": "4.0", // Also include full field name for compatibility
+        "v": "4.1",
+        "version": "4.1", // protocol version (full field alias); key-package version stays 4.0
         "ts": chrono::Utc::now().timestamp_millis(),
         "oi": offer["si"],
         "oc": offer["ci"],
@@ -999,7 +1023,7 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
         return Err(CoreError::protocol_violation("Invalid answer type"));
     }
     
-    if answer["v"].as_str() != Some("4.0") {
+    if answer["v"].as_str() != Some("4.1") {
         return Err(CoreError::protocol_violation("Unsupported protocol version"));
     }
     
@@ -1193,9 +1217,16 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
     let mut meta_okm = [0u8; 32];
     hk.expand(b"metadata-protection-v4", &mut meta_okm).map_err(|e| CoreError::crypto_failure(format!("HKDF expand meta failed: {:?}", e)))?;
 
-    // Compute key fingerprint (first 12 bytes of SHA-384 over meta_okm) for SAS computation
+    // Derive the dedicated fingerprint key (HKDF info 'fingerprint-generation-v4'),
+    // exactly like the web version's deriveSharedKeys. The SAS is computed from
+    // keyFingerprint = first 12 bytes of SHA-384 over THIS key (not the metadata key).
+    let mut fp_okm = [0u8; 32];
+    hk.expand(b"fingerprint-generation-v4", &mut fp_okm).map_err(|e| CoreError::crypto_failure(format!("HKDF expand fingerprint failed: {:?}", e)))?;
+
+    // Compute keyFingerprint (first 12 bytes of SHA-384 over the fingerprint key)
+    // to match the web version's SAS key material byte-for-byte.
     let mut fp_h = Sha384::new();
-    fp_h.update(&meta_okm);
+    fp_h.update(&fp_okm);
     let fp = fp_h.finalize();
     let key_fingerprint_bytes: [u8; 12] = {
         let mut bytes = [0u8; 12];
@@ -1253,7 +1284,7 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
         "sessionId": answer.get("si").cloned().unwrap_or(serde_json::Value::Null),
         "connectionId": answer.get("ci").cloned().unwrap_or(serde_json::Value::Null),
         "securityLevel": "MAX",
-        "protocolVersion": "4.0",
+        "protocolVersion": "4.1",
         "capabilities": ["encryption", "verification", "pfs", "mutual_auth"],
         "keyExchange": "completed",
         "sdp": answer_sdp,
@@ -1262,4 +1293,75 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
     });
     
     serde_json::to_string(&confirmation).map_err(|e| CoreError::internal_error(format!("JSON serialization failed: {}", e)))
+}
+
+#[cfg(test)]
+mod web_compat_tests {
+    use super::*;
+    use crate::session::OfferContext;
+
+    // Decode an SB1:gz payload back to its JSON object.
+    fn decode_sb1gz(payload: &str) -> serde_json::Value {
+        let b64 = payload.strip_prefix("SB1:gz:").expect("SB1:gz prefix");
+        let compressed = general_purpose::STANDARD.decode(b64).unwrap();
+        let mut s = String::new();
+        ZlibDecoder::new(&compressed[..]).read_to_string(&mut s).unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+
+    // Replicate the web's importPublicKeyFromSignedPackage verification exactly:
+    // packageCopy = { ...e }; delete packageCopy.signature; verify ECDSA-SHA384
+    // over JSON.stringify(packageCopy) using the key from the "d" package.
+    fn verify_e_signature_web_style(pkg: &serde_json::Value) {
+        let e = pkg.get("e").expect("offer must have e");
+        let d = pkg.get("d").expect("offer must have d");
+
+        let d_key_data = extract_bytes(d.get("keyData").unwrap()).unwrap();
+        let vk = p384::ecdsa::VerifyingKey::from_public_key_der(&d_key_data)
+            .expect("import ECDSA verifying key from d.keyData");
+
+        let sig_bytes = extract_bytes(e.get("signature").unwrap()).unwrap();
+        let sig = p384::ecdsa::Signature::from_slice(&sig_bytes).unwrap();
+
+        // Reconstruct the signed string the same way the web does.
+        let mut e_copy = e.as_object().unwrap().clone();
+        e_copy.remove("signature");
+        let package_string = serde_json::to_string(&serde_json::Value::Object(e_copy)).unwrap();
+
+        let mut hasher = Sha384::new();
+        hasher.update(package_string.as_bytes());
+        let digest = hasher.finalize();
+
+        vk.verify_prehash(&digest, &sig)
+            .expect("web-style ECDH signature verification must pass");
+    }
+
+    #[test]
+    fn offer_e_signature_is_web_verifiable() {
+        let state = Arc::new(Mutex::new(OfferContext::new()));
+        let offer = create_secure_offer(state, None).expect("create offer");
+        let pkg = decode_sb1gz(&offer);
+        assert_eq!(pkg.get("v").and_then(|v| v.as_str()), Some("4.1"));
+        // The "e" package must carry exactly these fields (no "ps").
+        let e = pkg.get("e").unwrap().as_object().unwrap();
+        let mut keys: Vec<&str> = e.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["keyData", "keyType", "signature", "timestamp", "version"]);
+        verify_e_signature_web_style(&pkg);
+    }
+
+    #[test]
+    fn answer_e_signature_is_web_verifiable() {
+        // Desktop offers, desktop answers (join): the answer's "e" must also be
+        // verifiable the web way, since the web offerer verifies it.
+        let offerer = Arc::new(Mutex::new(OfferContext::new()));
+        let offer = create_secure_offer(offerer, None).expect("create offer");
+
+        let ans_state = Arc::new(Mutex::new(OfferContext::new()));
+        let ans_keys = Arc::new(Mutex::new(SessionKeys::new()));
+        let answer = join_secure_connection(ans_state, ans_keys, offer, None).expect("join");
+        let pkg = decode_sb1gz(&answer);
+        assert_eq!(pkg.get("v").and_then(|v| v.as_str()), Some("4.1"));
+        verify_e_signature_web_style(&pkg);
+    }
 }

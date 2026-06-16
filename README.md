@@ -12,6 +12,20 @@
 
 ---
 
+## Web client compatibility
+
+This core implements the **same wire protocol as the SecureBit.chat web client**, so a desktop or mobile peer built on `securebit_core` interoperates directly with web peers (and vice-versa). The compatibility surface is exact and byte-level:
+
+- **Offer / answer packages** — identical compact field layout and `SB1:gz:` / `SB1:bin:` encoding.
+- **Signed key exchange** — ECDH P-384 public keys packaged and ECDSA-signed (SHA-384) in the same canonical, insertion-ordered JSON the web verifier reconstructs.
+- **Key schedule** — HKDF-SHA-256 with the same `info` labels and 64-byte session salt, truncating the P-384 shared secret to 32 bytes exactly as the Web Crypto API does.
+- **SAS (Short Authentication String)** — derived from the dedicated fingerprint key and the peers' **real DTLS fingerprints** (colon-separated, lowercased), so both implementations compute the same code.
+- **Message framing** — AES-256-GCM payloads with separately encrypted metadata and an HMAC-SHA-256 over the canonicalized payload.
+
+A handshake round-trip test and web-style signature-verification tests live in [`tests/`](tests/) and the `webrtc` module to guard this compatibility against regressions.
+
+---
+
 ##  Now Available: Desktop Applications!
 
 **SecureBit Chat desktop applications are now available for Windows, macOS, and Linux!**
