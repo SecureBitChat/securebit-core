@@ -895,9 +895,15 @@ pub fn join_secure_connection(
         d_sig_raw.as_ref().iter().map(|&b| serde_json::Value::Number(b.into())).collect()
     ));
     
+    // The SDP that actually goes on the wire — the browser's real answer when the
+    // frontend supplied one, otherwise our minimal stand-in. The SAS must be
+    // computed over the SAME fingerprint the peer will see, so hoist it here
+    // instead of consuming it inside the json! macro.
+    let effective_answer_sdp = answer_sdp.unwrap_or(minimal_answer_sdp);
+
     let answer_package = serde_json::json!({
         "t": "answer",
-        "s": answer_sdp.unwrap_or(minimal_answer_sdp),
+        "s": effective_answer_sdp.clone(),
         "v": "4.1",
         "version": "4.1", // protocol version (full field alias); key-package version stays 4.0
         "ts": chrono::Utc::now().timestamp_millis(),
@@ -943,12 +949,51 @@ pub fn join_secure_connection(
     hk.expand(b"metadata-protection-v4", &mut meta_okm)
         .map_err(|e| CoreError::crypto_failure(format!("HKDF expand meta failed: {:?}", e)))?;
     
+    // Derive the SAS ourselves, exactly as handle_secure_answer does on the other
+    // side and as the web client does in deriveSharedKeys + _computeSAS: the
+    // dedicated 'fingerprint-generation-v4' key, SHA-384, first 12 bytes, then
+    // HKDF over the two DTLS fingerprints (compute_sas_code sorts them, so both
+    // peers reach the same value regardless of orientation).
+    //
+    // Without this the joining side had NO code of its own and simply displayed
+    // whatever the offerer announced over the wire — which an attacker in the
+    // middle can choose, making the out-of-band comparison meaningless.
+    let mut fp_okm = [0u8; 32];
+    hk.expand(b"fingerprint-generation-v4", &mut fp_okm)
+        .map_err(|e| CoreError::crypto_failure(format!("HKDF expand fingerprint failed: {:?}", e)))?;
+
+    let mut fp_h = Sha384::new();
+    fp_h.update(&fp_okm);
+    let fp = fp_h.finalize();
+    let key_fingerprint_bytes: [u8; 12] = {
+        let mut bytes = [0u8; 12];
+        bytes.copy_from_slice(&fp[..12]);
+        bytes
+    };
+
+    // Local = our answer's fingerprint, remote = the offerer's.
+    let local_sas_fp = extract_dtls_fingerprint_from_sdp(&effective_answer_sdp).unwrap_or_default();
+    let remote_sas_fp = offer
+        .get("s")
+        .or_else(|| offer.get("sdp"))
+        .and_then(|v| v.as_str())
+        .and_then(extract_dtls_fingerprint_from_sdp)
+        .unwrap_or_default();
+
+    let local_verification_code = if !local_sas_fp.is_empty() && !remote_sas_fp.is_empty() {
+        Some(compute_sas_code(&key_fingerprint_bytes, &local_sas_fp, &remote_sas_fp)?)
+    } else {
+        None
+    };
+
     // Store session keys
     {
         let mut keys = session_keys.lock().map_err(|_| CoreError::state_error("Failed to acquire session_keys lock"))?;
         keys.encryption_key = Some(enc_okm.to_vec());
         keys.mac_key = Some(mac_okm.to_vec());
         keys.metadata_key = Some(meta_okm.to_vec());
+        keys.key_fingerprint = Some(crate::file_crypto::compute_key_fingerprint(shared_bytes, &offer_salt));
+        keys.verification_code = local_verification_code;
     }
     
     // Store local DTLS fingerprint in offer_state for SAS computation
@@ -956,6 +1001,11 @@ pub fn join_secure_connection(
     {
         let mut st = offer_state.lock().map_err(|_| CoreError::state_error("Failed to acquire offer_state lock"))?;
         st.local_dtls_fingerprint = Some(local_dtls_fp_hex);
+        // The joining peer adopts the offerer's salt as THE session salt. Both sides
+        // must agree on it: `get_session_crypto` hands it to the JS file-transfer
+        // layer, which derives every per-file key from it. Without this the answerer
+        // reports a null salt and file/voice transfer fails on that side entirely.
+        st.session_salt = Some(offer_salt.clone());
     }
     
     // Return SB1:gz encoded answer
@@ -1273,6 +1323,10 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
         keys.encryption_key = Some(enc_okm.to_vec());
         keys.mac_key = Some(mac_okm.to_vec());
         keys.metadata_key = Some(meta_okm.to_vec());
+        keys.key_fingerprint = Some(crate::file_crypto::compute_key_fingerprint(shared_bytes, &salt));
+        // Keep the locally derived SAS next to the keys so the frontend can read it
+        // back from one place on both sides of the handshake.
+        keys.verification_code = if verification_code.is_empty() { None } else { Some(verification_code.clone()) };
     }
     
     // Create connection confirmation compatible with web version
@@ -1363,5 +1417,65 @@ mod web_compat_tests {
         let pkg = decode_sb1gz(&answer);
         assert_eq!(pkg.get("v").and_then(|v| v.as_str()), Some("4.1"));
         verify_e_signature_web_style(&pkg);
+    }
+
+    // Both peers must derive the SAME SAS independently, from the shared secret and
+    // both DTLS fingerprints. The joining side used to derive nothing at all and
+    // displayed whatever the offerer announced over the wire, which makes the
+    // out-of-band comparison meaningless against an attacker in the middle.
+    #[test]
+    fn both_peers_derive_the_same_sas_independently() {
+        let offerer_state = Arc::new(Mutex::new(OfferContext::new()));
+        let offerer_keys = Arc::new(Mutex::new(SessionKeys::new()));
+        let offer = create_secure_offer(offerer_state.clone(), None).expect("create offer");
+
+        let ans_state = Arc::new(Mutex::new(OfferContext::new()));
+        let ans_keys = Arc::new(Mutex::new(SessionKeys::new()));
+        let answer = join_secure_connection(ans_state, ans_keys.clone(), offer, None).expect("join");
+
+        handle_secure_answer(offerer_state, offerer_keys.clone(), answer).expect("handle answer");
+
+        let joiner_sas = ans_keys.lock().unwrap().verification_code.clone();
+        let offerer_sas = offerer_keys.lock().unwrap().verification_code.clone();
+
+        let joiner_sas = joiner_sas.expect("the joining side must derive its own SAS");
+        let offerer_sas = offerer_sas.expect("the offering side must derive its own SAS");
+
+        assert_eq!(joiner_sas.len(), 7, "SAS is a 7-digit code, web-compatible");
+        assert!(joiner_sas.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(
+            joiner_sas, offerer_sas,
+            "both peers must independently reach the same SAS, or the out-of-band comparison cannot work"
+        );
+    }
+
+    // Cross-implementation pin: the same inputs must yield the same SAS here and in
+    // the web client, or a desktop<->web session shows the two users different codes
+    // and verification is impossible. The expected value was produced by the web's
+    // EnhancedSecureWebRTCManager.prototype._computeSAS with these exact inputs.
+    //
+    // Note the normalization this depends on: fingerprints keep their colons and are
+    // lowercased, and the salt is 'webrtc-sas|' + the two joined by '|' AFTER sorting.
+    #[test]
+    fn sas_matches_web_reference_vector() {
+        let key: Vec<u8> = (0..12u8).map(|i| i * 7 + 3).collect();
+        let a = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        let b = "12:34:56:78:9a:bc:de:f0:11:22:33:44:55:66:77:88";
+
+        assert_eq!(compute_sas_code(&key, a, b).unwrap(), "4202749");
+        assert_eq!(compute_sas_code(&key, b, a).unwrap(), "4202749");
+    }
+
+    // compute_sas_code sorts the two fingerprints, so orientation must not matter:
+    // each peer passes its own as "local" and the other as "remote".
+    #[test]
+    fn sas_is_orientation_independent() {
+        let key = [7u8; 12];
+        let a = "AA:BB:CC";
+        let b = "DD:EE:FF";
+        assert_eq!(
+            compute_sas_code(&key, a, b).unwrap(),
+            compute_sas_code(&key, b, a).unwrap()
+        );
     }
 }

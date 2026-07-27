@@ -1,130 +1,315 @@
 // Core struct that owns all internal state
 use crate::crypto::CryptoUtils;
+use crate::file_transfer::FileTransferManager;
 use crate::session::{OfferContext, SessionKeys};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Core struct that owns all internal state (crypto, sessions, WebRTC)
-/// This is the main entry point for the platform-agnostic core crate
-pub struct Core {
+/// The default session id used when a caller does not specify one. Keeps the
+/// original single-session behaviour working unchanged while multi-session
+/// callers pass their own ids.
+pub const DEFAULT_SESSION: &str = "default";
+
+/// All cryptographic + transfer state for ONE peer connection (one "chat").
+///
+/// This is the unit of multi-session: every open chat owns an isolated
+/// `Session`, so their keys, handshakes and file transfers never mix. The type
+/// is platform-agnostic — desktop (Tauri) and mobile share it verbatim.
+pub struct Session {
     crypto: Arc<Mutex<CryptoUtils>>,
     offer_state: Arc<Mutex<OfferContext>>,
     session_keys: Arc<Mutex<SessionKeys>>,
+    file_transfer: Arc<Mutex<FileTransferManager>>,
 }
 
-impl Core {
-    /// Create a new Core instance with initialized state
-    pub fn new() -> Self {
+impl Session {
+    fn new() -> Self {
         Self {
             crypto: Arc::new(Mutex::new(CryptoUtils::new())),
             offer_state: Arc::new(Mutex::new(OfferContext::new())),
             session_keys: Arc::new(Mutex::new(SessionKeys::new())),
+            file_transfer: Arc::new(Mutex::new(FileTransferManager::new())),
         }
     }
 
-    /// Get a reference to the crypto state
-    pub fn crypto(&self) -> Arc<Mutex<CryptoUtils>> {
-        self.crypto.clone()
+    pub fn crypto(&self) -> Arc<Mutex<CryptoUtils>> { self.crypto.clone() }
+    pub fn offer_state(&self) -> Arc<Mutex<OfferContext>> { self.offer_state.clone() }
+    pub fn session_keys(&self) -> Arc<Mutex<SessionKeys>> { self.session_keys.clone() }
+    pub fn file_transfer(&self) -> Arc<Mutex<FileTransferManager>> { self.file_transfer.clone() }
+
+    /// Snapshot the shared session encryption key (32 bytes) used for chunks.
+    fn session_encryption_key(&self) -> Option<Vec<u8>> {
+        self.session_keys
+            .lock()
+            .ok()
+            .and_then(|keys| keys.encryption_key.clone())
     }
 
-    /// Get a reference to the offer state
-    pub fn offer_state(&self) -> Arc<Mutex<OfferContext>> {
-        self.offer_state.clone()
+    /// Securely wipe every secret this session holds (keys, handshake material)
+    /// and drop any in-flight file transfers. Called on disconnect / close.
+    pub fn clear_secrets(&self) {
+        if let Ok(mut state) = self.offer_state.lock() {
+            state.ecdh_secret = None;
+            state.session_salt = None;
+            state.local_dtls_fingerprint = None;
+        }
+        if let Ok(mut keys) = self.session_keys.lock() {
+            if let Some(ref mut k) = keys.encryption_key { for byte in k.iter_mut() { *byte = 0; } }
+            if let Some(ref mut k) = keys.mac_key { for byte in k.iter_mut() { *byte = 0; } }
+            if let Some(ref mut k) = keys.metadata_key { for byte in k.iter_mut() { *byte = 0; } }
+            keys.encryption_key = None;
+            keys.mac_key = None;
+            keys.metadata_key = None;
+        }
+        if let Ok(mut manager) = self.file_transfer.lock() {
+            manager.clear();
+        }
     }
 
-    /// Get a reference to the session keys
-    pub fn session_keys(&self) -> Arc<Mutex<SessionKeys>> {
-        self.session_keys.clone()
+    /// Report what handshake / key material this session currently holds.
+    pub fn connection_state(&self) -> serde_json::Value {
+        let state = self.offer_state.lock().ok();
+        let keys = self.session_keys.lock().ok();
+        let has_ecdh = state.as_ref().map(|s| s.ecdh_secret.is_some()).unwrap_or(false);
+        let has_salt = state.as_ref().map(|s| s.session_salt.is_some()).unwrap_or(false);
+        let has_fp = state.as_ref().map(|s| s.local_dtls_fingerprint.is_some()).unwrap_or(false);
+        let has_enc = keys.as_ref().map(|k| k.encryption_key.is_some()).unwrap_or(false);
+        let has_mac = keys.as_ref().map(|k| k.mac_key.is_some()).unwrap_or(false);
+        let has_meta = keys.as_ref().map(|k| k.metadata_key.is_some()).unwrap_or(false);
+        serde_json::json!({
+            "has_offer_state": has_ecdh || has_salt,
+            "has_session_keys": has_enc || has_mac,
+            "has_ecdh_secret": has_ecdh,
+            "has_session_salt": has_salt,
+            "has_local_dtls_fingerprint": has_fp,
+            "has_encryption_key": has_enc,
+            "has_mac_key": has_mac,
+            "has_metadata_key": has_meta,
+        })
+    }
+}
+
+/// Core owns a registry of sessions keyed by id. This is the main entry point
+/// for the platform-agnostic core crate; every platform (desktop/mobile) drives
+/// multi-session chat entirely through these methods.
+pub struct Core {
+    sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+}
+
+impl Core {
+    /// Create a new Core with a single "default" session ready to use.
+    pub fn new() -> Self {
+        let mut map = HashMap::new();
+        map.insert(DEFAULT_SESSION.to_string(), Arc::new(Session::new()));
+        Self { sessions: Arc::new(Mutex::new(map)) }
     }
 
-    // Crypto methods
-    pub fn generate_key_pair(&self) -> Result<String, String> {
-        let mut crypto = self.crypto.lock()
-            .map_err(|_| "Failed to acquire crypto lock".to_string())?;
+    /// Resolve a session by id, lazily creating it if it does not exist.
+    /// `None` maps to the default session (back-compat for single-session code).
+    fn session(&self, session_id: Option<&str>) -> Arc<Session> {
+        let id = session_id.unwrap_or(DEFAULT_SESSION).to_string();
+        let mut map = self.sessions.lock().expect("sessions lock poisoned");
+        map.entry(id).or_insert_with(|| Arc::new(Session::new())).clone()
+    }
+
+    // ---- session lifecycle ----
+
+    /// Explicitly create a session (no-op if it already exists).
+    pub fn create_session(&self, session_id: &str) -> Result<(), String> {
+        let mut map = self.sessions.lock().map_err(|_| "sessions lock poisoned".to_string())?;
+        map.entry(session_id.to_string()).or_insert_with(|| Arc::new(Session::new()));
+        Ok(())
+    }
+
+    /// Wipe a session's secrets and remove it from the registry.
+    pub fn close_session(&self, session_id: &str) -> Result<(), String> {
+        let existing = {
+            let map = self.sessions.lock().map_err(|_| "sessions lock poisoned".to_string())?;
+            map.get(session_id).cloned()
+        };
+        if let Some(sess) = existing {
+            sess.clear_secrets();
+        }
+        let mut map = self.sessions.lock().map_err(|_| "sessions lock poisoned".to_string())?;
+        map.remove(session_id);
+        Ok(())
+    }
+
+    /// List all live session ids.
+    pub fn list_sessions(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Clear a session's secrets in place (keeps it in the registry so the tab
+    /// can be reused for a fresh handshake).
+    pub fn disconnect_session(&self, session_id: Option<&str>) -> Result<(), String> {
+        self.session(session_id).clear_secrets();
+        Ok(())
+    }
+
+    pub fn get_connection_state(&self, session_id: Option<&str>) -> serde_json::Value {
+        self.session(session_id).connection_state()
+    }
+
+    /// Web-compatible file-transfer crypto inputs for the JS layer: the key
+    /// fingerprint ("safety number") and the raw session salt. The JS file/voice
+    /// transfer derives per-file keys from these exactly like the web client.
+    pub fn get_session_crypto(&self, session_id: Option<&str>) -> serde_json::Value {
+        let s = self.session(session_id);
+        let (fingerprint, verification_code) = s
+            .session_keys()
+            .lock()
+            .ok()
+            .map(|k| (k.key_fingerprint.clone(), k.verification_code.clone()))
+            .unwrap_or((None, None));
+        let session_salt = s.offer_state().lock().ok().and_then(|st| st.session_salt.clone());
+        serde_json::json!({
+            "fingerprint": fingerprint,
+            "sessionSalt": session_salt,
+            // SAS derived locally from the shared secret — never taken from the wire.
+            "verificationCode": verification_code,
+        })
+    }
+
+    // ---- accessors (default session, kept for compatibility) ----
+    pub fn file_transfer(&self) -> Arc<Mutex<FileTransferManager>> { self.session(None).file_transfer() }
+    pub fn crypto(&self) -> Arc<Mutex<CryptoUtils>> { self.session(None).crypto() }
+    pub fn offer_state(&self) -> Arc<Mutex<OfferContext>> { self.session(None).offer_state() }
+    pub fn session_keys(&self) -> Arc<Mutex<SessionKeys>> { self.session(None).session_keys() }
+
+    // ---- crypto methods ----
+    pub fn generate_key_pair(&self, session_id: Option<&str>) -> Result<String, String> {
+        let s = self.session(session_id);
+        let mut crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
         crypto.generate_key_pair()
     }
 
-    pub fn encrypt_data(&self, data: &str, key_id: &str) -> Result<String, String> {
-        let crypto = self.crypto.lock()
-            .map_err(|_| "Failed to acquire crypto lock".to_string())?;
+    pub fn encrypt_data(&self, session_id: Option<&str>, data: &str, key_id: &str) -> Result<String, String> {
+        let s = self.session(session_id);
+        let crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
         let encrypted = crypto.encrypt_data(data, key_id)?;
         serde_json::to_string(&encrypted).map_err(|e| e.to_string())
     }
 
-    pub fn decrypt_data(&self, encrypted_data: &str) -> Result<String, String> {
-        let crypto = self.crypto.lock()
-            .map_err(|_| "Failed to acquire crypto lock".to_string())?;
-        let encrypted: crate::crypto::EncryptedData = serde_json::from_str(encrypted_data)
-            .map_err(|e| e.to_string())?;
+    pub fn decrypt_data(&self, session_id: Option<&str>, encrypted_data: &str) -> Result<String, String> {
+        let s = self.session(session_id);
+        let crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
+        let encrypted: crate::crypto::EncryptedData = serde_json::from_str(encrypted_data).map_err(|e| e.to_string())?;
         crypto.decrypt_data(&encrypted)
     }
 
-    pub fn get_security_level(&self) -> Result<String, String> {
-        let crypto = self.crypto.lock()
-            .map_err(|_| "Failed to acquire crypto lock".to_string())?;
+    pub fn get_security_level(&self, session_id: Option<&str>) -> Result<String, String> {
+        let s = self.session(session_id);
+        let crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
         let security = crypto.calculate_security_level();
         serde_json::to_string(&security).map_err(|e| e.to_string())
     }
 
-    pub fn generate_secure_password(&self, length: usize) -> Result<String, String> {
-        let crypto = self.crypto.lock()
-            .map_err(|_| "Failed to acquire crypto lock".to_string())?;
+    pub fn generate_secure_password(&self, session_id: Option<&str>, length: usize) -> Result<String, String> {
+        let s = self.session(session_id);
+        let crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
         Ok(crypto.generate_secure_password(length))
     }
 
-    // WebRTC methods
-    pub fn create_secure_offer(&self, offer_sdp: Option<String>) -> Result<String, String> {
-        crate::webrtc::create_secure_offer(self.offer_state.clone(), offer_sdp)
-            .map_err(|e| e.to_string())
+    // ---- WebRTC methods ----
+    pub fn create_secure_offer(&self, session_id: Option<&str>, offer_sdp: Option<String>) -> Result<String, String> {
+        let s = self.session(session_id);
+        crate::webrtc::create_secure_offer(s.offer_state.clone(), offer_sdp).map_err(|e| e.to_string())
     }
 
-    pub fn create_secure_answer(&self, offer_data: String, answer_sdp: Option<String>) -> Result<String, String> {
-        crate::webrtc::create_secure_answer(self.offer_state.clone(), offer_data, answer_sdp)
-            .map_err(|e| e.to_string())
+    pub fn create_secure_answer(&self, session_id: Option<&str>, offer_data: String, answer_sdp: Option<String>) -> Result<String, String> {
+        let s = self.session(session_id);
+        crate::webrtc::create_secure_answer(s.offer_state.clone(), offer_data, answer_sdp).map_err(|e| e.to_string())
     }
 
     pub fn parse_secure_offer(&self, offer_data: String) -> Result<String, String> {
-        crate::webrtc::parse_secure_offer(offer_data)
+        crate::webrtc::parse_secure_offer(offer_data).map_err(|e| e.to_string())
+    }
+
+    pub fn join_secure_connection(&self, session_id: Option<&str>, offer_data: String, answer_sdp: Option<String>) -> Result<String, String> {
+        let s = self.session(session_id);
+        crate::webrtc::join_secure_connection(s.offer_state.clone(), s.session_keys.clone(), offer_data, answer_sdp)
             .map_err(|e| e.to_string())
     }
 
-    pub fn join_secure_connection(&self, offer_data: String, answer_sdp: Option<String>) -> Result<String, String> {
-        crate::webrtc::join_secure_connection(
-            self.offer_state.clone(),
-            self.session_keys.clone(),
-            offer_data,
-            answer_sdp
-        )
-        .map_err(|e| e.to_string())
+    pub fn handle_secure_answer(&self, session_id: Option<&str>, answer_data: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        crate::webrtc::handle_secure_answer(s.offer_state.clone(), s.session_keys.clone(), answer_data)
+            .map_err(|e| e.to_string())
     }
 
-    pub fn handle_secure_answer(&self, answer_data: String) -> Result<String, String> {
-        crate::webrtc::handle_secure_answer(
-            self.offer_state.clone(),
-            self.session_keys.clone(),
-            answer_data
-        )
-        .map_err(|e| e.to_string())
-    }
-
-    // Session methods
-    pub fn encrypt_enhanced_message(&self, message: String, message_id: String, sequence_number: u64) -> Result<String, String> {
-        let result = crate::session::encrypt_enhanced_message(
-            self.session_keys.clone(),
-            message,
-            message_id,
-            sequence_number
-        )?;
+    // ---- session (messaging) methods ----
+    pub fn encrypt_enhanced_message(&self, session_id: Option<&str>, message: String, message_id: String, sequence_number: u64) -> Result<String, String> {
+        let s = self.session(session_id);
+        let result = crate::session::encrypt_enhanced_message(s.session_keys.clone(), message, message_id, sequence_number)?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
-    pub fn decrypt_enhanced_message(&self, encrypted_message: String) -> Result<String, String> {
+    pub fn decrypt_enhanced_message(&self, session_id: Option<&str>, encrypted_message: String) -> Result<String, String> {
+        let s = self.session(session_id);
         let message_data: serde_json::Value = serde_json::from_str(&encrypted_message)
             .map_err(|e| format!("Failed to parse encrypted message: {}", e))?;
-        let result = crate::session::decrypt_enhanced_message(
-            self.session_keys.clone(),
-            message_data
-        )?;
+        let result = crate::session::decrypt_enhanced_message(s.session_keys.clone(), message_data)?;
         serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
+    // ---- file transfer methods ----
+    pub fn file_prepare_outgoing(&self, session_id: Option<&str>, file_id: String, file_name: String, file_type: String, data_base64: String) -> Result<String, String> {
+        use base64::{engine::general_purpose, Engine as _};
+        let data = general_purpose::STANDARD.decode(data_base64.trim()).map_err(|_| "Invalid base64 file data".to_string())?;
+        let s = self.session(session_id);
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let start = manager.prepare_outgoing(file_id, file_name, file_type, data)?;
+        serde_json::to_string(&start).map_err(|e| e.to_string())
+    }
+
+    pub fn file_next_chunk(&self, session_id: Option<&str>, file_id: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        let key = s.session_encryption_key().ok_or_else(|| "No session key available".to_string())?;
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let chunk = manager.next_chunk(&file_id, &key)?;
+        serde_json::to_string(&chunk).map_err(|e| e.to_string())
+    }
+
+    pub fn file_handle_incoming(&self, session_id: Option<&str>, message_json: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        let message: serde_json::Value = serde_json::from_str(&message_json).map_err(|e| format!("Failed to parse file message: {}", e))?;
+        let key = s.session_encryption_key();
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let event = manager.handle_incoming(&message, key.as_deref())?;
+        serde_json::to_string(&event).map_err(|e| e.to_string())
+    }
+
+    pub fn file_accept(&self, session_id: Option<&str>, file_id: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let response = manager.accept(&file_id)?;
+        serde_json::to_string(&response).map_err(|e| e.to_string())
+    }
+
+    pub fn file_reject(&self, session_id: Option<&str>, file_id: String, reason: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let response = manager.reject(&file_id, &reason)?;
+        serde_json::to_string(&response).map_err(|e| e.to_string())
+    }
+
+    pub fn file_cancel(&self, session_id: Option<&str>, file_id: String) -> Result<(), String> {
+        let s = self.session(session_id);
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        manager.cancel(&file_id);
+        Ok(())
+    }
+
+    pub fn file_clear(&self, session_id: Option<&str>) {
+        let ft = self.session(session_id).file_transfer();
+        let locked = ft.lock();
+        if let Ok(mut manager) = locked {
+            manager.clear();
+        }
     }
 }
 
@@ -133,4 +318,3 @@ impl Default for Core {
         Self::new()
     }
 }
-

@@ -17,6 +17,17 @@ pub struct SessionKeys {
     pub encryption_key: Option<Vec<u8>>, // 32 bytes
     pub mac_key: Option<Vec<u8>>, // 64 bytes - Web Crypto API использует 64-байтовый ключ для HMAC-SHA-256
     pub metadata_key: Option<Vec<u8>>, // 32 bytes
+    // Web-compatible "safety number" (colon-hex). Mixed into every per-file key so
+    // file/voice transfers interoperate with the web client. Derived alongside the
+    // session keys from the same shared secret + salt.
+    pub key_fingerprint: Option<String>,
+    // SAS ("short authentication string") this peer derived ITSELF from the shared
+    // secret and both DTLS fingerprints. This is the code the user compares
+    // out-of-band, so it must never come from the wire: a peer-supplied code lets
+    // an attacker in the middle show the same number to both sides and the whole
+    // comparison becomes theatre. The joining side used to have none at all and
+    // simply displayed whatever the offerer announced.
+    pub verification_code: Option<String>,
 }
 
 impl SessionKeys {
@@ -25,6 +36,8 @@ impl SessionKeys {
             encryption_key: None,
             mac_key: None,
             metadata_key: None,
+            key_fingerprint: None,
+            verification_code: None,
         }
     }
 }
@@ -305,27 +318,41 @@ pub fn decrypt_enhanced_message(
     let message_text = String::from_utf8(message_plaintext.to_vec())
         .map_err(|e| format!("Failed to convert decrypted message to UTF-8: {}", e))?;
     
-    // Try to parse as JSON to extract the actual message text
-    // Web version sends JSON like: {"type":"message","data":"test",...}
-    let actual_message = if let Ok(message_json) = serde_json::from_str::<serde_json::Value>(&message_text) {
-        // Extract "data" field if it exists, otherwise use the whole text
-        if let Some(data_field) = message_json.get("data") {
-            if let Some(text) = data_field.as_str() {
-                text.to_string()
-            } else {
-                message_text
-            }
-        } else {
-            message_text
-        }
-    } else {
-        // Not JSON, use as-is
-        message_text
-    };
-    
+    // Parse the (possibly enveloped) plaintext once to extract the chat text and
+    // any per-message UI metadata. Web version sends JSON like:
+    //   {"type":"message","data":"test","meta":{"mid":"...","once":true,...}}
+    let parsed_envelope = serde_json::from_str::<serde_json::Value>(&message_text).ok();
+    let actual_message = parsed_envelope
+        .as_ref()
+        .and_then(|j| j.get("data"))
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| message_text.clone());
+    // Per-message UI metadata (mid / view-once / disappearing timer). Forwarded
+    // verbatim so the platform layer can apply view-once / unsend / timers and
+    // stay interoperable with the web client.
+    let meta = parsed_envelope
+        .as_ref()
+        .and_then(|j| j.get("meta"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    // Envelope type (e.g. "message" or "presence"). Web-compatible control
+    // messages (presence/availability) ride the same encrypted path as chat
+    // text and are distinguished by this field; the platform layer consumes
+    // control types instead of displaying them.
+    let envelope_type = parsed_envelope
+        .as_ref()
+        .and_then(|j| j.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("message")
+        .to_string();
+
     // Return decrypted message (web version returns { message, messageId, timestamp, sequenceNumber })
     Ok(serde_json::json!({
+        "type": envelope_type,
         "message": actual_message,
+        "meta": meta,
         "messageId": metadata.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "timestamp": metadata.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
         "sequenceNumber": metadata.get("sequenceNumber").and_then(|v| v.as_u64()).unwrap_or(0)
