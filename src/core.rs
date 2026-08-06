@@ -230,8 +230,15 @@ impl Core {
 
     pub fn get_security_level(&self, session_id: Option<&str>) -> Result<String, String> {
         let s = self.session(session_id);
+        // Measure the live session, so the panel reports what is actually
+        // running rather than a fixed result.
+        let (session_established, ratchet_active) = s
+            .session_keys
+            .lock()
+            .map(|k| (k.encryption_key.is_some(), k.ratchet.is_some()))
+            .unwrap_or((false, false));
         let crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
-        let security = crypto.calculate_security_level();
+        let security = crypto.calculate_security_level(session_established, ratchet_active);
         serde_json::to_string(&security).map_err(|e| e.to_string())
     }
 

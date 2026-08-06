@@ -187,8 +187,12 @@ impl CryptoUtils {
             .collect()
     }
 
-    /// Calculate security level based on various tests
-    pub fn calculate_security_level(&self) -> SecurityLevel {
+    /// Calculate security level based on various tests.
+    ///
+    /// `session_established` / `ratchet_active` come from the live session
+    /// state: the panel must measure what it displays (web 5.7.1 parity), not
+    /// return fixed results for the two properties users care about most.
+    pub fn calculate_security_level(&self, session_established: bool, ratchet_active: bool) -> SecurityLevel {
         let mut tests_passed = 0;
         let mut total_tests = 0;
         let mut details = Vec::new();
@@ -233,18 +237,33 @@ impl CryptoUtils {
             details.push("Message Integrity: FAILED (no key available)".to_string());
         }
 
-        // Test 4: Perfect Forward Secrecy
+        // Test 4: Perfect Forward Secrecy — measured, not asserted. Session-level
+        // PFS exists whenever the ephemeral handshake produced keys; per-MESSAGE
+        // forward secrecy exists only while the Double Ratchet is running.
         total_tests += 1;
-        // Note: This test verifies key generation, but true PFS requires ephemeral keys per session
-        // For full PFS, use the WebRTC protocol which generates ephemeral ECDH keys
-        tests_passed += 1;
-        details.push("Perfect Forward Secrecy: PASSED (key generation verified, use WebRTC for full PFS)".to_string());
+        if ratchet_active {
+            tests_passed += 1;
+            details.push("Perfect Forward Secrecy: PASSED (Double Ratchet — per-message keys)".to_string());
+        } else if session_established {
+            tests_passed += 1;
+            details.push("Perfect Forward Secrecy: PASSED (per-session ephemeral keys; peer lacks Double Ratchet)".to_string());
+        } else {
+            details.push("Perfect Forward Secrecy: FAILED (no established session)".to_string());
+        }
 
-        // Test 5: Replay Protection
+        // Test 5: Replay Protection — provided by sequence-numbered AAD on the
+        // static path and by key destruction in the ratchet. Random IVs alone
+        // never provided it, so this no longer passes unconditionally.
         total_tests += 1;
-        // Random IVs (nonces) provide replay protection - each encryption uses unique IV
-        tests_passed += 1;
-        details.push("Replay Protection: PASSED (random IVs per encryption)".to_string());
+        if ratchet_active {
+            tests_passed += 1;
+            details.push("Replay Protection: PASSED (ratchet message keys are destroyed on use)".to_string());
+        } else if session_established {
+            tests_passed += 1;
+            details.push("Replay Protection: PASSED (sequence-numbered AAD on the session path)".to_string());
+        } else {
+            details.push("Replay Protection: FAILED (no established session)".to_string());
+        }
 
         let level = if tests_passed == total_tests { 95 } else { (tests_passed * 100 / total_tests) as u8 };
 
@@ -295,9 +314,17 @@ mod tests {
         let decrypted = crypto.decrypt_data(&encrypted).unwrap();
         assert_eq!(test_data, decrypted);
         
-        // Test security level
-        let security = crypto.calculate_security_level();
+        // Test security level: with no session and no ratchet the PFS and
+        // replay checks must FAIL — they used to pass unconditionally, which
+        // is exactly the lie the web's 5.7.1 hardening removed.
+        let security = crypto.calculate_security_level(false, false);
         assert!(security.level > 0);
+        assert_eq!(security.tests_passed, 3);
+        assert!(security.details.iter().any(|d| d.starts_with("Perfect Forward Secrecy: FAILED")));
+
+        let live = crypto.calculate_security_level(true, true);
+        assert_eq!(live.tests_passed, 5);
+        assert!(live.details.iter().any(|d| d.contains("Double Ratchet")));
     }
 }
 
