@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod file_crypto;
+pub mod ratchet;
 pub mod session;
 pub mod webrtc;
 pub mod file_transfer;
