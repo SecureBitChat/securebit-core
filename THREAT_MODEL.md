@@ -76,10 +76,11 @@ This document describes the threats that `securebit_core` mitigates and the thre
 - **Ephemeral ECDH Keys**: Each connection uses fresh ephemeral keys
 - **No Long-Term Keys**: The core does not use long-term keys for encryption
 - **Key Derivation**: Session keys are derived from ephemeral shared secrets
+- **Double Ratchet**: When both peers support it, each message gets its own key and each change of direction mixes a fresh shared secret into the schedule, so captured state does not reach back to earlier messages and loses its value as the conversation moves on
 
-**Implementation**: Ephemeral key generation is in `core/src/webrtc.rs`.
+**Implementation**: Ephemeral key generation is in `core/src/webrtc.rs`; the ratchet lives in `core/src/ratchet.rs`.
 
-**Limitation**: If an attacker compromises the session keys during an active session, they can decrypt messages in that session.
+**Limitation**: With a peer that does not support the ratchet, the session runs on its per-session keys, and an attacker who compromises those keys during an active session can decrypt messages in that session.
 
 ---
 
@@ -238,7 +239,7 @@ This document describes the threats that `securebit_core` mitigates and the thre
 | **Eavesdropping** | ✅ Yes (AES-256-GCM) | ⚠️ Partial (if keys compromised) | Core |
 | **Message Tampering** | ✅ Yes (HMAC, AES-GCM, ECDSA) | ❌ No (if keys compromised) | Core |
 | **Replay Attacks** | ✅ Yes (sequence numbers) | ⚠️ Partial (requires app validation) | Core + Application |
-| **Perfect Forward Secrecy** | ✅ Yes (ephemeral keys) | ⚠️ Partial (if session keys compromised) | Core |
+| **Perfect Forward Secrecy** | ✅ Yes (ephemeral keys; per message with the Double Ratchet) | ⚠️ Partial (per-session keys only, when a peer lacks ratchet support) | Core |
 | **Protocol Attacks** | ✅ Yes (validation, state machine) | ❌ No (if protocol flawed) | Core |
 | **Compromised OS** | ❌ No | ❌ No | OS + Hardware |
 | **Compromised Hardware** | ❌ No | ❌ No | Hardware |

@@ -18,6 +18,7 @@ The core guarantees:
 - **AES-256-GCM Encryption**: Authenticated encryption for message confidentiality and integrity
 - **HMAC-SHA-256**: Message authentication codes for integrity verification
 - **Session Key Isolation**: Separate keys for encryption, MAC, and metadata protection
+- **Double Ratchet**: When both peers support it, every message is protected with its own key, derived through a one way function and destroyed after use; the session falls back to its per-session keys with older peers
 
 **Implementation**: All cryptographic operations use well-vetted Rust crates (`p384`, `aes-gcm`, `hkdf`, `hmac`) with no custom cryptographic primitives.
 
@@ -39,6 +40,7 @@ The core guarantees:
 
 - **Ephemeral Keys**: ECDH keys are generated fresh for each connection
 - **Secure Key Derivation**: Session keys are derived using HKDF with specific info labels
+- **Per-Message Keys**: Under the Double Ratchet, message keys exist only long enough to encrypt or decrypt one message
 - **Key Isolation**: Keys are stored in memory only, never persisted
 - **Secure Cleanup**: Keys are zeroed before deallocation (when possible in Rust)
 

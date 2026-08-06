@@ -40,6 +40,7 @@ a reviewer where to look, and where there is nothing to find.
 |---|---|
 | Key exchange | Ephemeral ECDH P-384, ECDSA P-384 signatures over the key packages, HKDF-SHA-256 key schedule |
 | Session keys | Separate message, MAC, metadata and fingerprint keys derived from one shared secret |
+| Message ratchet | Double Ratchet in the Signal design, giving every message its own key; agreed during the handshake and used only when both peers support it |
 | Messages | AES-256-GCM payload, separately encrypted metadata, HMAC-SHA-256 over the canonical payload |
 | Verification | Short authentication string derived from the shared secret and both DTLS fingerprints |
 | Files and voice notes | Per-file key derivation, per-chunk AES-256-GCM, SHA-256 integrity over the whole file |
@@ -63,17 +64,18 @@ a reviewer where to look, and where there is nothing to find.
 
 | File | Size | What to review |
 |---|---:|---|
-| [`src/webrtc.rs`](src/webrtc.rs) | ~1470 lines | Offer/answer construction, signature verification, ECDH, SAS derivation |
+| [`src/webrtc.rs`](src/webrtc.rs) | ~1620 lines | Offer/answer construction, signature verification, ECDH, SAS derivation, ratchet negotiation |
 | [`src/file_transfer.rs`](src/file_transfer.rs) | ~610 lines | Transfer state machine, consent, chunk validation, integrity check |
-| [`src/session.rs`](src/session.rs) | ~360 lines | Message encryption and decryption, metadata protection, MAC |
-| [`src/core.rs`](src/core.rs) | ~315 lines | Public API surface and session isolation |
-| [`src/crypto.rs`](src/crypto.rs) | ~300 lines | Key-pair generation, generic encrypt/decrypt helpers |
+| [`src/ratchet.rs`](src/ratchet.rs) | ~570 lines | Double Ratchet: chain and root key derivation, out of order handling, frame authentication |
+| [`src/session.rs`](src/session.rs) | ~490 lines | Message encryption and decryption, metadata protection, MAC, chat frame selection |
+| [`src/core.rs`](src/core.rs) | ~440 lines | Public API surface and session isolation |
+| [`src/crypto.rs`](src/crypto.rs) | ~330 lines | Key-pair generation, generic encrypt/decrypt helpers, measured security level |
 | [`src/file_crypto.rs`](src/file_crypto.rs) | ~110 lines | Key fingerprint and per-file key derivation, chunk encryption |
 
 State lives in three places, all behind `Arc<Mutex<_>>` and none of it persisted:
 crypto state (key pairs), offer state (ECDH secret, session salt, DTLS
 fingerprint) and session keys (message, MAC, metadata keys, key fingerprint,
-verification code).
+verification code, and the ratchet state when a session runs one).
 
 ---
 
@@ -86,12 +88,18 @@ verification code).
 | Key derivation | HKDF-SHA-256, 64-byte session salt, distinct `info` label per derived key |
 | Message confidentiality | AES-256-GCM, fresh 12-byte nonce per message |
 | Message integrity | HMAC-SHA-256 over the canonicalized payload, plus the GCM tag |
+| Per-message keys | Double Ratchet (Signal design): HKDF-SHA-256 root steps, HMAC-SHA-256 chain steps, a fresh AES-256-GCM key and nonce for every message |
 | File chunks | AES-256-GCM, fresh nonce per chunk, SHA-256 over the whole file |
 | MITM detection | 7-digit SAS from HKDF over the shared secret and both DTLS fingerprints |
 
-Forward secrecy comes from the ephemeral ECDH key pair: it exists only for the
-lifetime of a session and is never persisted, so compromising the device later
-does not decrypt traffic captured earlier.
+Forward secrecy works on two levels. The ephemeral ECDH key pair exists only
+for the lifetime of a session and is never persisted, so compromising the
+device later does not decrypt traffic captured earlier. On top of that, when
+both peers support it, the Double Ratchet gives every message its own key,
+derived through a one way function and destroyed after use, so even state
+captured during a live session does not reach back to earlier messages. With a
+peer that lacks ratchet support the session simply stays on the per-session
+keys it always had.
 
 All primitives come from the RustCrypto ecosystem (`p384`, `aes-gcm`, `hkdf`,
 `hmac`, `sha2`), with `rand` for randomness. There is no `unsafe` code and no
@@ -118,6 +126,10 @@ direction. The compatibility surface is byte-exact:
   implementations reach the same code.
 - **Messages** — AES-256-GCM payloads with separately encrypted metadata and an
   HMAC-SHA-256 over the canonicalized payload.
+- **Double Ratchet** — the same key derivation tree, header format and frame
+  encoding as the web implementation, with support agreed through the same
+  handshake field. A web peer and a peer built on this crate ratchet together;
+  a peer without support keeps working on the session keys.
 - **Files and voice notes** — the same per-file key derivation, chunk framing
   and `file_transfer_*` message shapes.
 
@@ -236,6 +248,15 @@ The suite pins the properties an audit should care about:
 | `duplicate_chunk_is_idempotent` | A replayed chunk cannot corrupt the result |
 | `corrupted_chunk_fails_decryption` | Tampering is detected rather than silently accepted |
 | `rejection_stops_transfer` | Refusal leaves no state behind |
+| `handshake_brings_up_an_interoperating_ratchet` | A full handshake leaves both sides ratcheting together |
+| `offer_and_answer_advertise_ratchet_support` | Ratchet support is announced where the web client expects it |
+| `full_conversation_with_direction_changes` | The ratchet survives replies, gaps and both directions |
+| `tampered_frame_leaves_no_trace` | A forged ratchet frame fails without desynchronising the session |
+| `replay_is_rejected` | A ratchet frame cannot be delivered twice |
+
+The desktop repository additionally runs the real web `DoubleRatchet.js`
+against this crate over live frames in both directions, as part of its
+interoperability suite.
 
 ---
 
@@ -243,8 +264,9 @@ The suite pins the properties an audit should care about:
 
 **Guaranteed here:** confidentiality and integrity of messages and files under
 the derived session keys; authentication of the key exchange; forward secrecy
-from ephemeral keys; a deterministic verification code for MITM detection;
-strict validation of every input parsed from the wire.
+from ephemeral keys, and per message when both peers run the Double Ratchet; a
+deterministic verification code for MITM detection; strict validation of every
+input parsed from the wire.
 
 **Not guaranteed here**, and out of scope by design:
 
