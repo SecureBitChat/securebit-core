@@ -1,6 +1,6 @@
 // Core struct that owns all internal state
 use crate::crypto::CryptoUtils;
-use crate::file_transfer::FileTransferManager;
+use crate::file_transfer::{AssembledFile, FileTransferManager, TransferCrypto};
 use crate::session::{OfferContext, SessionKeys};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,11 +38,34 @@ impl Session {
     pub fn file_transfer(&self) -> Arc<Mutex<FileTransferManager>> { self.file_transfer.clone() }
 
     /// Snapshot the shared session encryption key (32 bytes) used for chunks.
+    #[allow(dead_code)]
     fn session_encryption_key(&self) -> Option<Vec<u8>> {
         self.session_keys
             .lock()
             .ok()
             .and_then(|keys| keys.encryption_key.clone())
+    }
+
+    /// The handshake-derived inputs every per-file transfer key is built from.
+    ///
+    /// Both are read off this session, never off the wire: the key fingerprint
+    /// each peer computed independently, and the session salt they agreed on.
+    fn transfer_crypto(&self) -> Result<TransferCrypto, String> {
+        let fingerprint = self
+            .session_keys
+            .lock()
+            .map_err(|_| "Failed to acquire session key lock".to_string())?
+            .key_fingerprint
+            .clone()
+            .ok_or_else(|| "Session crypto not ready (complete the handshake first)".to_string())?;
+        let salt = self
+            .offer_state
+            .lock()
+            .map_err(|_| "Failed to acquire offer state lock".to_string())?
+            .session_salt
+            .clone()
+            .ok_or_else(|| "Session crypto not ready (no session salt)".to_string())?;
+        TransferCrypto::new(fingerprint, salt)
     }
 
     /// Securely wipe every secret this session holds (keys, handshake material)
@@ -60,6 +83,10 @@ impl Session {
             keys.encryption_key = None;
             keys.mac_key = None;
             keys.metadata_key = None;
+            // The ratchet holds the only raw chain/root key material in the
+            // session; its Drop impl zeroizes every key it retains.
+            keys.ratchet = None;
+            keys.peer_supports_ratchet = false;
         }
         if let Ok(mut manager) = self.file_transfer.lock() {
             manager.clear();
@@ -256,38 +283,122 @@ impl Core {
         serde_json::to_string(&result).map_err(|e| e.to_string())
     }
 
-    // ---- file transfer methods ----
-    pub fn file_prepare_outgoing(&self, session_id: Option<&str>, file_id: String, file_name: String, file_type: String, data_base64: String) -> Result<String, String> {
-        use base64::{engine::general_purpose, Engine as _};
-        let data = general_purpose::STANDARD.decode(data_base64.trim()).map_err(|_| "Invalid base64 file data".to_string())?;
+    /// Encrypt one outbound chat payload into the complete wire frame —
+    /// `ratchet_message` when the Double Ratchet has a sending chain, otherwise
+    /// the static `enhanced_message` envelope (see session::encrypt_chat_frame).
+    pub fn encrypt_chat_frame(&self, session_id: Option<&str>, message: String, message_id: String, sequence_number: u64) -> Result<String, String> {
         let s = self.session(session_id);
+        let frame = crate::session::encrypt_chat_frame(s.session_keys.clone(), message, message_id, sequence_number)?;
+        serde_json::to_string(&frame).map_err(|e| e.to_string())
+    }
+
+    /// Decrypt an inbound `ratchet_message` frame. `header` must be the exact
+    /// string off the wire — it is the AES-GCM AAD.
+    pub fn decrypt_ratchet_message(&self, session_id: Option<&str>, header: String, ciphertext: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        let result = crate::session::decrypt_ratchet_message(s.session_keys.clone(), &header, &ciphertext)?;
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    }
+
+    /// What protection the message path is actually running, measured off the
+    /// live session state — for the UI's security panel.
+    pub fn ratchet_status(&self, session_id: Option<&str>) -> Result<String, String> {
+        let s = self.session(session_id);
+        let status = crate::session::ratchet_status(s.session_keys.clone());
+        serde_json::to_string(&status).map_err(|e| e.to_string())
+    }
+
+    // ---- file transfer methods ----
+
+    /// Register an outgoing file from raw bytes.
+    ///
+    /// Preferred over the base64 entry point on memory-constrained platforms: a
+    /// 100 MB file costs ~133 MB more as base64, and both copies would be live
+    /// at once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn file_prepare_outgoing_bytes(
+        &self,
+        session_id: Option<&str>,
+        file_id: String,
+        file_name: String,
+        file_type: String,
+        data: Vec<u8>,
+        is_voice: bool,
+        voice_json: Option<String>,
+    ) -> Result<String, String> {
+        let s = self.session(session_id);
+        let crypto = s.transfer_crypto()?;
+        let voice = match voice_json {
+            Some(text) if !text.trim().is_empty() => Some(
+                serde_json::from_str(&text)
+                    .map_err(|e| format!("Failed to parse voice descriptor: {}", e))?,
+            ),
+            _ => None,
+        };
         let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
-        let start = manager.prepare_outgoing(file_id, file_name, file_type, data)?;
+        let start = manager.prepare_outgoing(file_id, file_name, file_type, data, is_voice, voice, &crypto)?;
         serde_json::to_string(&start).map_err(|e| e.to_string())
     }
 
+    pub fn file_prepare_outgoing(&self, session_id: Option<&str>, file_id: String, file_name: String, file_type: String, data_base64: String) -> Result<String, String> {
+        use base64::{engine::general_purpose, Engine as _};
+        let data = general_purpose::STANDARD.decode(data_base64.trim()).map_err(|_| "Invalid base64 file data".to_string())?;
+        self.file_prepare_outgoing_bytes(session_id, file_id, file_name, file_type, data, false, None)
+    }
+
+    /// The next chunk of an accepted transfer, or `"null"` when done.
     pub fn file_next_chunk(&self, session_id: Option<&str>, file_id: String) -> Result<String, String> {
         let s = self.session(session_id);
-        let key = s.session_encryption_key().ok_or_else(|| "No session key available".to_string())?;
         let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
-        let chunk = manager.next_chunk(&file_id, &key)?;
+        let chunk = manager.next_chunk(&file_id)?;
+        serde_json::to_string(&chunk).map_err(|e| e.to_string())
+    }
+
+    /// Re-emit one chunk the peer asked for again (loss recovery).
+    pub fn file_chunk_at(&self, session_id: Option<&str>, file_id: String, index: usize) -> Result<String, String> {
+        let s = self.session(session_id);
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let chunk = manager.chunk_at(&file_id, index)?;
         serde_json::to_string(&chunk).map_err(|e| e.to_string())
     }
 
     pub fn file_handle_incoming(&self, session_id: Option<&str>, message_json: String) -> Result<String, String> {
         let s = self.session(session_id);
         let message: serde_json::Value = serde_json::from_str(&message_json).map_err(|e| format!("Failed to parse file message: {}", e))?;
-        let key = s.session_encryption_key();
         let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
-        let event = manager.handle_incoming(&message, key.as_deref())?;
+        let event = manager.handle_incoming(&message)?;
         serde_json::to_string(&event).map_err(|e| e.to_string())
     }
 
     pub fn file_accept(&self, session_id: Option<&str>, file_id: String) -> Result<String, String> {
         let s = self.session(session_id);
+        let crypto = s.transfer_crypto()?;
         let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
-        let response = manager.accept(&file_id)?;
+        let response = manager.accept(&file_id, &crypto)?;
         serde_json::to_string(&response).map_err(|e| e.to_string())
+    }
+
+    /// Ask the peer to resend whatever an incoming transfer still lacks.
+    /// Returns `"null"` when nothing is missing.
+    pub fn file_request_missing(&self, session_id: Option<&str>, file_id: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        let manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        serde_json::to_string(&manager.request_missing(&file_id)).map_err(|e| e.to_string())
+    }
+
+    /// Collect a completed incoming file's bytes, exactly once.
+    pub fn file_take_assembled(&self, session_id: Option<&str>, file_id: &str) -> Result<AssembledFile, String> {
+        let s = self.session(session_id);
+        let mut manager = s.file_transfer.lock().map_err(|_| "Lock poisoned".to_string())?;
+        manager
+            .take_assembled(file_id)
+            .ok_or_else(|| "No assembled file with that id".to_string())
+    }
+
+    /// The `file_transfer_error` frame telling the peer we are giving up.
+    pub fn file_error_message(&self, file_id: &str, reason: &str) -> Result<String, String> {
+        serde_json::to_string(&FileTransferManager::error_message(file_id, reason))
+            .map_err(|e| e.to_string())
     }
 
     pub fn file_reject(&self, session_id: Option<&str>, file_id: String, reason: String) -> Result<String, String> {

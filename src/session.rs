@@ -5,9 +5,12 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::{Arc, Mutex};
 
-// Offer context to persist ephemeral state between offer and answer handling
+// Offer context to persist ephemeral state between offer and answer handling.
+// The ECDH secret is a `SecretKey` (not `EphemeralSecret`) because the Double
+// Ratchet needs the responder's handshake private key as its first ratchet key
+// pair — the initiator's first DH deliberately lands on it.
 pub struct OfferContext {
-    pub ecdh_secret: Option<p384::ecdh::EphemeralSecret>,
+    pub ecdh_secret: Option<p384::SecretKey>,
     pub session_salt: Option<Vec<u8>>, // 64 bytes
     pub local_dtls_fingerprint: Option<String>, // Local DTLS fingerprint for SAS computation
 }
@@ -28,6 +31,12 @@ pub struct SessionKeys {
     // comparison becomes theatre. The joining side used to have none at all and
     // simply displayed whatever the offerer announced.
     pub verification_code: Option<String>,
+    // Double Ratchet state. None until both peers have advertised support
+    // (`dr` in the offer AND the answer) and the handshake produced keys; a
+    // session where only one side ratchets cannot decrypt anything, so a
+    // missing flag downgrades both sides to the static keys above.
+    pub ratchet: Option<crate::ratchet::DoubleRatchet>,
+    pub peer_supports_ratchet: bool,
 }
 
 impl SessionKeys {
@@ -38,6 +47,8 @@ impl SessionKeys {
             metadata_key: None,
             key_fingerprint: None,
             verification_code: None,
+            ratchet: None,
+            peer_supports_ratchet: false,
         }
     }
 }
@@ -357,5 +368,124 @@ pub fn decrypt_enhanced_message(
         "timestamp": metadata.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
         "sequenceNumber": metadata.get("sequenceNumber").and_then(|v| v.as_u64()).unwrap_or(0)
     }))
+}
+
+/// Split a decrypted chat plaintext into (envelope type, display text, meta).
+/// The plaintext is either bare text or the web envelope
+/// `{"type":"message","data":"…","meta":{…}}` — both paths (static and
+/// ratcheted) carry the same inner shape, so the UI layer stays unchanged.
+fn parse_plaintext_envelope(text: &str) -> (String, String, serde_json::Value) {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    let actual = parsed
+        .as_ref()
+        .and_then(|j| j.get("data"))
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| text.to_string());
+    let meta = parsed
+        .as_ref()
+        .and_then(|j| j.get("meta"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let envelope_type = parsed
+        .as_ref()
+        .and_then(|j| j.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("message")
+        .to_string();
+    (envelope_type, actual, meta)
+}
+
+/// Encrypt one outbound chat payload into the COMPLETE wire frame, choosing the
+/// strongest path available — exactly the web client's send logic:
+///
+///   - Ratchet with a sending chain → `ratchet_message` (per-message key,
+///     destroyed after use).
+///   - Otherwise → the static `enhanced_message` envelope. This covers both
+///     peers without ratchet support and the responder's first few frames,
+///     which by construction precede its sending chain.
+///
+/// Returning the whole frame keeps the fallback decision next to the keys it
+/// depends on instead of leaking it into every platform layer.
+pub fn encrypt_chat_frame(
+    session_keys: Arc<Mutex<SessionKeys>>,
+    message: String,
+    message_id: String,
+    sequence_number: u64,
+) -> Result<serde_json::Value, String> {
+    {
+        let mut keys = session_keys.lock()
+            .map_err(|_| "Failed to acquire session keys lock".to_string())?;
+        if let Some(ref mut ratchet) = keys.ratchet {
+            if ratchet.can_encrypt() {
+                let (header, ciphertext) = ratchet.encrypt(&message)?;
+                return Ok(serde_json::json!({
+                    "type": "ratchet_message",
+                    "h": header,
+                    "c": ciphertext,
+                    "version": "5.0"
+                }));
+            }
+        }
+    } // Release the lock before the static path re-acquires it.
+
+    let payload = encrypt_enhanced_message(session_keys, message, message_id, sequence_number)?;
+    Ok(serde_json::json!({
+        "type": "enhanced_message",
+        "data": payload,
+        "keyVersion": 0,
+        "version": "4.0"
+    }))
+}
+
+/// Decrypt an inbound `ratchet_message` frame. `header` must be the exact
+/// string off the wire (it is the AAD). Returns the same shape as
+/// `decrypt_enhanced_message` so the platform layer handles both identically.
+/// No sequence-number check belongs here: replay protection is a property of
+/// the ratchet itself — a used message key no longer exists.
+pub fn decrypt_ratchet_message(
+    session_keys: Arc<Mutex<SessionKeys>>,
+    header: &str,
+    ciphertext: &str,
+) -> Result<serde_json::Value, String> {
+    let plaintext = {
+        let mut keys = session_keys.lock()
+            .map_err(|_| "Failed to acquire session keys lock".to_string())?;
+        let ratchet = keys.ratchet.as_mut()
+            .ok_or("Received a ratchet message but no ratchet is active")?;
+        ratchet.decrypt(header, ciphertext)?
+    };
+
+    let (envelope_type, actual_message, meta) = parse_plaintext_envelope(&plaintext);
+    Ok(serde_json::json!({
+        "type": envelope_type,
+        "message": actual_message,
+        "meta": meta,
+        "messageId": "",
+        "timestamp": 0,
+        "sequenceNumber": 0
+    }))
+}
+
+/// What protection the session's message path is actually running — measured
+/// off the live state, never assumed from capability flags.
+pub fn ratchet_status(session_keys: Arc<Mutex<SessionKeys>>) -> serde_json::Value {
+    let keys = match session_keys.lock() {
+        Ok(k) => k,
+        Err(_) => return serde_json::json!({ "active": false, "error": "lock poisoned" }),
+    };
+    match keys.ratchet {
+        Some(ref r) => serde_json::json!({
+            "active": true,
+            "canEncrypt": r.can_encrypt(),
+            "peerSupportsRatchet": keys.peer_supports_ratchet,
+            "state": r.state_json(),
+        }),
+        None => serde_json::json!({
+            "active": false,
+            "canEncrypt": false,
+            "peerSupportsRatchet": keys.peer_supports_ratchet,
+        }),
+    }
 }
 

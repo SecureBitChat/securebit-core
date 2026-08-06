@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 use rand::Rng;
 use p384::{ecdsa::{SigningKey, Signature, signature::Verifier}, PublicKey as P384Pub, pkcs8::{EncodePublicKey, DecodePublicKey}};
 use ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
-use p384::ecdh::EphemeralSecret as P384Secret;
 use sha2::{Digest, Sha256, Sha384};
 use flate2::{Compression, write::ZlibEncoder, read::{ZlibDecoder, GzDecoder, DeflateDecoder}};
 use base64::{engine::general_purpose, Engine};
@@ -15,9 +14,10 @@ use std::io::Write;
 use hkdf::Hkdf;
 
 pub fn create_secure_offer(offer_state: Arc<Mutex<OfferContext>>, offer_sdp: Option<String>) -> Result<String, CoreError> {
-    // Generate P-384 keys for compatibility
-    let ecdh_secret = P384Secret::random(&mut rand::thread_rng());
-    let ecdh_public = P384Pub::from(&ecdh_secret);
+    // Generate P-384 keys for compatibility. A reusable SecretKey (not
+    // EphemeralSecret): the Double Ratchet derives from the handshake keys.
+    let ecdh_secret = p384::SecretKey::random(&mut rand::thread_rng());
+    let ecdh_public: P384Pub = ecdh_secret.public_key();
     let ecdsa_signing = SigningKey::random(&mut rand::thread_rng());
     let ecdsa_public = ecdsa_signing.verifying_key();
     
@@ -157,10 +157,16 @@ pub fn create_secure_offer(offer_state: Arc<Mutex<OfferContext>>, offer_sdp: Opt
         // Authentication (essential)
         "vc": verification_code, // verificationCode
         "ac": auth_challenge, // authChallenge
-        
+
         // Security metadata (simplified)
         "slv": "MAX", // securityLevel
-        
+
+        // Double Ratchet support (web RATCHET_VERSION). Advertised rather than
+        // assumed so a peer on an earlier release keeps working on the
+        // static-key path instead of failing to decrypt anything. Absent = not
+        // supported.
+        "dr": crate::ratchet::RATCHET_VERSION,
+
         // Key fingerprints (shortened)
         "kf": {
             "e": hex::encode(&sha2::Sha256::digest(ecdh_spki_der.as_bytes()))[0..12].to_string(),
@@ -237,8 +243,8 @@ pub fn create_secure_answer(
     }
 
     // Generate P-384 keys for answer
-    let ecdh_secret = P384Secret::random(&mut rand::thread_rng());
-    let ecdh_public = P384Pub::from(&ecdh_secret);
+    let ecdh_secret = p384::SecretKey::random(&mut rand::thread_rng());
+    let ecdh_public: P384Pub = ecdh_secret.public_key();
     let ecdsa_signing = SigningKey::random(&mut rand::thread_rng());
     let ecdsa_public = ecdsa_signing.verifying_key();
 
@@ -757,9 +763,17 @@ pub fn join_secure_connection(
     let peer_ecdh_public = p384::PublicKey::from_public_key_der(&peer_ecdh_spki)
         .map_err(|e| CoreError::crypto_failure(format!("Failed to import peer ECDH key: {}", e)))?;
     
-    // Generate our P-384 keys for answer
-    let ecdh_secret = P384Secret::random(&mut rand::thread_rng());
-    let ecdh_public = P384Pub::from(&ecdh_secret);
+    // Did the initiator advertise the Double Ratchet? Absent means an older
+    // build, which is a downgrade to the static-key scheme rather than a
+    // failure — with no server there is no way to roll both ends at once.
+    let peer_supports_ratchet =
+        offer.get("dr").and_then(|v| v.as_u64()) == Some(crate::ratchet::RATCHET_VERSION);
+
+    // Generate our P-384 keys for answer. A reusable SecretKey: as the joining
+    // (responder) side, this exact key pair becomes the ratchet's first key
+    // pair — the initiator's first DH deliberately lands on it.
+    let ecdh_secret = p384::SecretKey::random(&mut rand::thread_rng());
+    let ecdh_public: P384Pub = ecdh_secret.public_key();
     let ecdsa_signing = SigningKey::random(&mut rand::thread_rng());
     let ecdsa_public = ecdsa_signing.verifying_key();
     
@@ -917,6 +931,8 @@ pub fn join_secure_connection(
         "vc": format!("{:06}", rand::thread_rng().gen_range(100000..999999)),
         "ac": (0..32).map(|_| format!("{:02x}", rand::thread_rng().gen::<u8>())).collect::<String>(),
         "slv": "MAX",
+        // Double Ratchet support (see the note on the offer package).
+        "dr": crate::ratchet::RATCHET_VERSION,
         "kf": {
             "e": hex::encode(&sha2::Sha256::digest(ecdh_spki_der.as_bytes()))[0..12].to_string(),
             "d": hex::encode(&sha2::Sha256::digest(ecdsa_spki_der.as_bytes()))[0..12].to_string()
@@ -924,9 +940,9 @@ pub fn join_secure_connection(
     });
     
     // Derive keys immediately (like web version does)
-    let shared = ecdh_secret.diffie_hellman(&peer_ecdh_public);
+    let shared = p384::ecdh::diffie_hellman(ecdh_secret.to_nonzero_scalar(), peer_ecdh_public.as_affine());
     let shared_bytes_full = shared.raw_secret_bytes();
-    
+
     // Truncate to 32 bytes (matching Web Crypto API)
     let shared_bytes: &[u8] = if shared_bytes_full.len() >= 32 {
         &shared_bytes_full[..32]
@@ -962,6 +978,13 @@ pub fn join_secure_connection(
     hk.expand(b"fingerprint-generation-v4", &mut fp_okm)
         .map_err(|e| CoreError::crypto_failure(format!("HKDF expand fingerprint failed: {:?}", e)))?;
 
+    // Root for the Double Ratchet: its own domain-separated branch of the key
+    // schedule (web deriveSharedKeys, info 'double-ratchet-root-v1'), so
+    // learning a session key tells an attacker nothing about the ratchet.
+    let mut dr_root_okm = [0u8; 32];
+    hk.expand(b"double-ratchet-root-v1", &mut dr_root_okm)
+        .map_err(|e| CoreError::crypto_failure(format!("HKDF expand ratchet root failed: {:?}", e)))?;
+
     let mut fp_h = Sha384::new();
     fp_h.update(&fp_okm);
     let fp = fp_h.finalize();
@@ -986,6 +1009,24 @@ pub fn join_secure_connection(
         None
     };
 
+    // Bring up the Double Ratchet if the initiator advertised it. As the
+    // responder we keep our handshake key pair as the ratchet pair and take no
+    // sending chain until the initiator's first message arrives. Failure is
+    // deliberately not fatal: falling back to the static keys is the behaviour
+    // of every release before the ratchet, and better than not connecting.
+    let ratchet = if peer_supports_ratchet {
+        match crate::ratchet::DoubleRatchet::init_responder(&dr_root_okm, &offer_salt, ecdh_secret.clone()) {
+            Ok(r) => Some(r),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    {
+        use zeroize::Zeroize;
+        dr_root_okm.zeroize(); // Folded into the ratchet (or abandoned) — either way it must not linger.
+    }
+
     // Store session keys
     {
         let mut keys = session_keys.lock().map_err(|_| CoreError::state_error("Failed to acquire session_keys lock"))?;
@@ -994,6 +1035,8 @@ pub fn join_secure_connection(
         keys.metadata_key = Some(meta_okm.to_vec());
         keys.key_fingerprint = Some(crate::file_crypto::compute_key_fingerprint(shared_bytes, &offer_salt));
         keys.verification_code = local_verification_code;
+        keys.peer_supports_ratchet = peer_supports_ratchet;
+        keys.ratchet = ratchet;
     }
     
     // Store local DTLS fingerprint in offer_state for SAS computation
@@ -1076,7 +1119,11 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
     if answer["v"].as_str() != Some("4.1") {
         return Err(CoreError::protocol_violation("Unsupported protocol version"));
     }
-    
+
+    // Does the responder speak our ratchet version? (see the offer side)
+    let peer_supports_ratchet =
+        answer.get("dr").and_then(|v| v.as_u64()) == Some(crate::ratchet::RATCHET_VERSION);
+
     // Extract keys
     let ecdh_pkg = &answer["e"];
     let ecdsa_key = &answer["d"];
@@ -1231,9 +1278,9 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
     if salt.len() != 64 { 
         return Err(CoreError::protocol_violation(format!("Invalid salt length: {} (expected 64)", salt.len()))); 
     }
-    let shared = ecdh_secret.diffie_hellman(&peer_ecdh);
+    let shared = p384::ecdh::diffie_hellman(ecdh_secret.to_nonzero_scalar(), peer_ecdh.as_affine());
     let shared_bytes_full = shared.raw_secret_bytes();
-    
+
     // ВАЖНО: Web Crypto API обрезает shared secret до 32 байт при использовании AES-GCM, length: 256
     // Нужно использовать только первые 32 байта для совместимости с JS версией
     let shared_bytes: &[u8] = if shared_bytes_full.len() >= 32 {
@@ -1272,6 +1319,12 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
     // keyFingerprint = first 12 bytes of SHA-384 over THIS key (not the metadata key).
     let mut fp_okm = [0u8; 32];
     hk.expand(b"fingerprint-generation-v4", &mut fp_okm).map_err(|e| CoreError::crypto_failure(format!("HKDF expand fingerprint failed: {:?}", e)))?;
+
+    // Root for the Double Ratchet — its own domain-separated branch of the key
+    // schedule (web deriveSharedKeys, info 'double-ratchet-root-v1').
+    let mut dr_root_okm = [0u8; 32];
+    hk.expand(b"double-ratchet-root-v1", &mut dr_root_okm)
+        .map_err(|e| CoreError::crypto_failure(format!("HKDF expand ratchet root failed: {:?}", e)))?;
 
     // Compute keyFingerprint (first 12 bytes of SHA-384 over the fingerprint key)
     // to match the web version's SAS key material byte-for-byte.
@@ -1317,6 +1370,23 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
         "".to_string()
     };
     
+    // Bring up the Double Ratchet if the responder advertised it. As the
+    // initiator we adopt a fresh ratchet key immediately, so even our very
+    // first message has already left the handshake key behind. Failure is
+    // deliberately not fatal — the session falls back to the static keys.
+    let ratchet = if peer_supports_ratchet {
+        match crate::ratchet::DoubleRatchet::init_initiator(&dr_root_okm, &salt, &peer_ecdh) {
+            Ok(r) => Some(r),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    {
+        use zeroize::Zeroize;
+        dr_root_okm.zeroize(); // Folded into the ratchet (or abandoned) — must not linger.
+    }
+
     // Store session keys for message decryption (duplicate store for compatibility)
     {
         let mut keys = session_keys.lock().map_err(|_| CoreError::state_error("Failed to acquire session_keys lock"))?;
@@ -1327,6 +1397,8 @@ pub fn handle_secure_answer(offer_state: Arc<Mutex<OfferContext>>, session_keys:
         // Keep the locally derived SAS next to the keys so the frontend can read it
         // back from one place on both sides of the handshake.
         keys.verification_code = if verification_code.is_empty() { None } else { Some(verification_code.clone()) };
+        keys.peer_supports_ratchet = peer_supports_ratchet;
+        keys.ratchet = ratchet;
     }
     
     // Create connection confirmation compatible with web version
@@ -1477,5 +1549,70 @@ mod web_compat_tests {
             compute_sas_code(&key, a, b).unwrap(),
             compute_sas_code(&key, b, a).unwrap()
         );
+    }
+
+    // The `dr` flag is how peers negotiate the Double Ratchet (web
+    // RATCHET_VERSION). It must sit in both packages, or a web 5.7.x peer
+    // silently downgrades the whole session to static keys.
+    #[test]
+    fn offer_and_answer_advertise_ratchet_support() {
+        let offer_state = Arc::new(Mutex::new(OfferContext::new()));
+        let offer = create_secure_offer(offer_state, None).unwrap();
+        let offer_pkg = decode_sb1gz(&offer);
+        assert_eq!(offer_pkg["dr"].as_u64(), Some(crate::ratchet::RATCHET_VERSION));
+
+        let join_state = Arc::new(Mutex::new(OfferContext::new()));
+        let join_keys = Arc::new(Mutex::new(crate::session::SessionKeys::new()));
+        let answer = join_secure_connection(join_state, join_keys, offer, None).unwrap();
+        let answer_pkg = decode_sb1gz(&answer);
+        assert_eq!(answer_pkg["dr"].as_u64(), Some(crate::ratchet::RATCHET_VERSION));
+    }
+
+    // Full handshake through the real offer/join/answer flow must leave BOTH
+    // sides with a live ratchet that interoperates: initiator sends first (its
+    // init deliberately steps the root once), the responder gains a sending
+    // chain only after that first message, and replies then ratchet back.
+    #[test]
+    fn handshake_brings_up_an_interoperating_ratchet() {
+        let offerer_state = Arc::new(Mutex::new(OfferContext::new()));
+        let offerer_keys = Arc::new(Mutex::new(crate::session::SessionKeys::new()));
+        let joiner_state = Arc::new(Mutex::new(OfferContext::new()));
+        let joiner_keys = Arc::new(Mutex::new(crate::session::SessionKeys::new()));
+
+        let offer = create_secure_offer(offerer_state.clone(), None).unwrap();
+        let answer = join_secure_connection(joiner_state, joiner_keys.clone(), offer, None).unwrap();
+        handle_secure_answer(offerer_state, offerer_keys.clone(), answer).unwrap();
+
+        // Initiator can send immediately; responder must not be able to yet.
+        let frame: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(
+                &crate::session::encrypt_chat_frame(offerer_keys.clone(), "hi".into(), "m1".into(), 0).unwrap()
+            ).unwrap()
+        ).unwrap();
+        assert_eq!(frame["type"].as_str(), Some("ratchet_message"),
+            "initiator's first frame must already be ratcheted");
+
+        // Responder's pre-first-inbound frame falls back to the static path,
+        // exactly like the web client's presence update on verification.
+        let early = crate::session::encrypt_chat_frame(joiner_keys.clone(), "early".into(), "m0".into(), 0).unwrap();
+        assert_eq!(early["type"].as_str(), Some("enhanced_message"),
+            "responder has no sending chain before the initiator's first message");
+
+        let opened = crate::session::decrypt_ratchet_message(
+            joiner_keys.clone(),
+            frame["h"].as_str().unwrap(),
+            frame["c"].as_str().unwrap(),
+        ).unwrap();
+        assert_eq!(opened["message"].as_str(), Some("hi"));
+
+        // Now the responder ratchets its reply, and the initiator reads it.
+        let reply = crate::session::encrypt_chat_frame(joiner_keys, "yo".into(), "m2".into(), 1).unwrap();
+        assert_eq!(reply["type"].as_str(), Some("ratchet_message"));
+        let opened = crate::session::decrypt_ratchet_message(
+            offerer_keys,
+            reply["h"].as_str().unwrap(),
+            reply["c"].as_str().unwrap(),
+        ).unwrap();
+        assert_eq!(opened["message"].as_str(), Some("yo"));
     }
 }
