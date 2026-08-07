@@ -249,8 +249,22 @@ impl Core {
     }
 
     // ---- WebRTC methods ----
+    /// Create an invitation.
+    ///
+    /// Emits SBQ2 when the switch is on and the webview supplied real SDP. The
+    /// fallback to SB1 is not a downgrade path for an SBQ2 session: it applies
+    /// only before any format is latched, and only when there is no SDP to
+    /// describe (the minimal-SDP path SB1 carries for its own reasons).
     pub fn create_secure_offer(&self, session_id: Option<&str>, offer_sdp: Option<String>) -> Result<String, String> {
         let s = self.session(session_id);
+        if crate::sbq2_handshake::SBQ2_SEND_ENABLED {
+            if let Some(sdp) = offer_sdp.clone() {
+                if !sdp.trim().is_empty() {
+                    return crate::sbq2_handshake::create_offer(s.offer_state.clone(), sdp)
+                        .map_err(|e| e.to_string());
+                }
+            }
+        }
         crate::webrtc::create_secure_offer(s.offer_state.clone(), offer_sdp).map_err(|e| e.to_string())
     }
 
@@ -259,20 +273,71 @@ impl Core {
         crate::webrtc::create_secure_answer(s.offer_state.clone(), offer_data, answer_sdp).map_err(|e| e.to_string())
     }
 
+    /// Inspect an invitation. Reception of both formats is unconditional and
+    /// does NOT consult the send switch, so a build with SBQ2 emission disabled
+    /// still reads SBQ2 invitations from a peer that has it on.
     pub fn parse_secure_offer(&self, offer_data: String) -> Result<String, String> {
+        if crate::sbq2_handshake::is_sbq2(&offer_data) {
+            return crate::sbq2_handshake::parse_offer(&offer_data)
+                .map(|v| v.to_string())
+                .map_err(|e| e.to_string());
+        }
         crate::webrtc::parse_secure_offer(offer_data).map_err(|e| e.to_string())
     }
 
     pub fn join_secure_connection(&self, session_id: Option<&str>, offer_data: String, answer_sdp: Option<String>) -> Result<String, String> {
         let s = self.session(session_id);
+        if crate::sbq2_handshake::is_sbq2(&offer_data) {
+            let sdp = answer_sdp.filter(|x| !x.trim().is_empty())
+                .ok_or_else(|| "An SBQ2 invitation needs real answer SDP from the connection".to_string())?;
+            return crate::sbq2_handshake::join(s.offer_state.clone(), &offer_data, sdp)
+                .map_err(|e| e.to_string());
+        }
         crate::webrtc::join_secure_connection(s.offer_state.clone(), s.session_keys.clone(), offer_data, answer_sdp)
             .map_err(|e| e.to_string())
     }
 
     pub fn handle_secure_answer(&self, session_id: Option<&str>, answer_data: String) -> Result<String, String> {
         let s = self.session(session_id);
+        if crate::sbq2_handshake::is_sbq2(&answer_data) {
+            return crate::sbq2_handshake::handle_answer(s.offer_state.clone(), &answer_data)
+                .map(|v| v.to_string())
+                .map_err(|e| e.to_string());
+        }
         crate::webrtc::handle_secure_answer(s.offer_state.clone(), s.session_keys.clone(), answer_data)
             .map_err(|e| e.to_string())
+    }
+
+    // ---- SBQ2 in-band key exchange ----
+    // The webview relays these two frames over the data channel; every decision
+    // about them is made in the core.
+
+    /// Our key blob (base64), to be sent as the first frame after the channel opens.
+    pub fn sbq2_local_key_blob(&self, session_id: Option<&str>) -> Result<String, String> {
+        let s = self.session(session_id);
+        crate::sbq2_handshake::local_key_blob(s.offer_state.clone()).map_err(|e| e.to_string())
+    }
+
+    /// Accept the peer's blob: checks the commitment BEFORE parsing it, derives
+    /// the session from the transcript, and returns our identity proof and the
+    /// safety code. Any failure here must close the connection.
+    pub fn sbq2_accept_peer_blob(&self, session_id: Option<&str>, peer_blob: String) -> Result<String, String> {
+        let s = self.session(session_id);
+        crate::sbq2_handshake::accept_peer_blob(s.offer_state.clone(), s.session_keys.clone(), &peer_blob)
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Verify the peer's transcript signature.
+    pub fn sbq2_verify_peer_proof(&self, session_id: Option<&str>, proof: String) -> Result<bool, String> {
+        let s = self.session(session_id);
+        crate::sbq2_handshake::verify_peer_proof(s.offer_state.clone(), &proof).map_err(|e| e.to_string())
+    }
+
+    /// True when this session is running the SBQ2 handshake.
+    pub fn sbq2_is_active(&self, session_id: Option<&str>) -> bool {
+        let s = self.session(session_id);
+        s.offer_state.lock().map(|st| st.sbq2.is_some()).unwrap_or(false)
     }
 
     // ---- session (messaging) methods ----

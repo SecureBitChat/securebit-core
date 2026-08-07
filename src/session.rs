@@ -13,6 +13,42 @@ pub struct OfferContext {
     pub ecdh_secret: Option<p384::SecretKey>,
     pub session_salt: Option<Vec<u8>>, // 64 bytes
     pub local_dtls_fingerprint: Option<String>, // Local DTLS fingerprint for SAS computation
+    /// SBQ2 handshake state. `None` on the legacy SB1 path.
+    pub sbq2: Option<Sbq2State>,
+}
+
+/// Per-connection state for the SBQ2 handshake.
+///
+/// Its presence is also the latch that fixes the format for this connection: the
+/// entry points refuse to switch once it is set, so a session that began as SBQ2
+/// cannot be pushed back onto SB1 partway through. Every failure closes the
+/// connection instead of degrading.
+pub struct Sbq2State {
+    pub role: crate::keyexchange::Role,
+    /// Our own descriptor, verbatim — it goes into the transcript as sent.
+    pub local_descriptor: Option<Vec<u8>>,
+    pub remote_descriptor: Option<Vec<u8>>,
+    pub local_blob: Option<Vec<u8>>,
+    pub remote_blob: Option<Vec<u8>>,
+    pub remote_commitment: Option<[u8; 16]>,
+    pub transcript: Option<Vec<u8>>,
+    /// Our identity key, kept to sign the transcript once it is closed.
+    pub ecdsa_signing: Option<p384::ecdsa::SigningKey>,
+    pub peer_ecdsa: Option<p384::ecdsa::VerifyingKey>,
+    pub peer_ecdh: Option<p384::PublicKey>,
+    pub proof_verified: bool,
+}
+
+impl Sbq2State {
+    pub fn new(role: crate::keyexchange::Role) -> Self {
+        Self {
+            role,
+            local_descriptor: None, remote_descriptor: None,
+            local_blob: None, remote_blob: None, remote_commitment: None,
+            transcript: None, ecdsa_signing: None,
+            peer_ecdsa: None, peer_ecdh: None, proof_verified: false,
+        }
+    }
 }
 
 // Session keys for message encryption/decryption
@@ -59,6 +95,7 @@ impl OfferContext {
             ecdh_secret: None,
             session_salt: None,
             local_dtls_fingerprint: None,
+            sbq2: None,
         }
     }
 }
