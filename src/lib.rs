@@ -3,6 +3,8 @@ pub mod descriptor;
 pub mod keyexchange;
 pub mod sbq2_handshake;
 pub mod file_crypto;
+pub mod group_crypto;
+pub mod group_session;
 pub mod ratchet;
 pub mod session;
 pub mod webrtc;

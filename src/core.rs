@@ -1,6 +1,8 @@
 // Core struct that owns all internal state
 use crate::crypto::CryptoUtils;
+use crate::error::CoreError;
 use crate::file_transfer::{AssembledFile, FileTransferManager, TransferCrypto};
+use crate::group_session::{self, Action, GroupSession};
 use crate::session::{OfferContext, SessionKeys};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -121,6 +123,13 @@ impl Session {
 /// multi-session chat entirely through these methods.
 pub struct Core {
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    /// Groups, by group id.
+    ///
+    /// A group is NOT a session: it owns no keys of the pairwise kind and no
+    /// transport, it is an orchestration layer over several sessions. It is kept
+    /// here for the same reason sessions are — one registry the platform layer
+    /// addresses by id, with the state itself never leaving the core.
+    groups: Arc<Mutex<HashMap<String, GroupSession>>>,
 }
 
 impl Core {
@@ -128,7 +137,10 @@ impl Core {
     pub fn new() -> Self {
         let mut map = HashMap::new();
         map.insert(DEFAULT_SESSION.to_string(), Arc::new(Session::new()));
-        Self { sessions: Arc::new(Mutex::new(map)) }
+        Self {
+            sessions: Arc::new(Mutex::new(map)),
+            groups: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Resolve a session by id, lazily creating it if it does not exist.
@@ -246,6 +258,115 @@ impl Core {
         let s = self.session(session_id);
         let crypto = s.crypto.lock().map_err(|_| "Failed to acquire crypto lock".to_string())?;
         Ok(crypto.generate_secure_password(length))
+    }
+
+    // ---- groups ----
+    //
+    // The platform drives a group the way it drives anything else here: it calls
+    // in, and gets back the list of things to do. Every method below returns the
+    // actions as JSON so the boundary can be an IPC call, a JNI hop or a channel
+    // without this crate caring which.
+
+    /// Start a group on this device. `group_id` is `None` for a group we create
+    /// and `Some(id)` for one we were invited to.
+    pub fn group_create(&self, group_id: Option<&str>, name: &str, is_admin: bool) -> Result<serde_json::Value, String> {
+        let gid = match group_id {
+            Some(id) => id.to_string(),
+            None => GroupSession::new_group_id(),
+        };
+        let session = GroupSession::new(&gid, name, is_admin).map_err(String::from)?;
+        let snapshot = session.snapshot();
+        let mut map = self.groups.lock().map_err(|_| "groups lock poisoned".to_string())?;
+        if map.contains_key(&gid) {
+            return Err("that group already exists".to_string());
+        }
+        map.insert(gid, session);
+        Ok(snapshot)
+    }
+
+    /// Run one operation against a group. The group's state never leaves here.
+    pub fn group_with<T>(
+        &self,
+        gid: &str,
+        f: impl FnOnce(&mut GroupSession) -> Result<T, CoreError>,
+    ) -> Result<T, String> {
+        let mut map = self.groups.lock().map_err(|_| "groups lock poisoned".to_string())?;
+        let session = map.get_mut(gid).ok_or_else(|| "no such group".to_string())?;
+        f(session).map_err(String::from)
+    }
+
+    /// The same, for operations that cannot fail.
+    pub fn group_with_infallible<T>(
+        &self,
+        gid: &str,
+        f: impl FnOnce(&mut GroupSession) -> T,
+    ) -> Result<T, String> {
+        let mut map = self.groups.lock().map_err(|_| "groups lock poisoned".to_string())?;
+        let session = map.get_mut(gid).ok_or_else(|| "no such group".to_string())?;
+        Ok(f(session))
+    }
+
+    /// Convenience for the common shape: an operation that yields actions.
+    pub fn group_actions(
+        &self,
+        gid: &str,
+        f: impl FnOnce(&mut GroupSession) -> Result<Vec<Action>, CoreError>,
+    ) -> Result<serde_json::Value, String> {
+        let actions = self.group_with(gid, f)?;
+        Ok(group_session::actions_to_json(&actions))
+    }
+
+    pub fn group_snapshot(&self, gid: &str) -> Result<serde_json::Value, String> {
+        self.group_with_infallible(gid, |g| g.snapshot())
+    }
+
+    pub fn group_ids(&self) -> Vec<String> {
+        self.groups
+            .lock()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Tear a group down and forget it. Its identity key goes with it.
+    pub fn group_destroy(&self, gid: &str) -> Result<serde_json::Value, String> {
+        let mut map = self.groups.lock().map_err(|_| "groups lock poisoned".to_string())?;
+        match map.remove(gid) {
+            Some(mut session) => Ok(group_session::actions_to_json(&session.destroy())),
+            None => Ok(serde_json::Value::Array(vec![])),
+        }
+    }
+
+    /// Is any group routing through this pairwise session?
+    ///
+    /// A group is built out of these sessions, so one of them is not just a chat
+    /// the user can close — it may be a group's only route to a member.
+    pub fn group_carries_session(&self, session_id: &str) -> bool {
+        self.groups
+            .lock()
+            .map(|m| m.values().any(|g| g.carries_session(session_id)))
+            .unwrap_or(false)
+    }
+
+    /// Mirror a pairwise link's health onto every group that routes through it.
+    pub fn group_sync_link(&self, session_id: &str, connected: bool) -> Result<serde_json::Value, String> {
+        let mut map = self.groups.lock().map_err(|_| "groups lock poisoned".to_string())?;
+        let mut out = serde_json::Map::new();
+        for (gid, session) in map.iter_mut() {
+            let actions = session.set_session_state(session_id, connected);
+            if !actions.is_empty() {
+                out.insert(gid.clone(), group_session::actions_to_json(&actions));
+            }
+        }
+        Ok(serde_json::Value::Object(out))
+    }
+
+    /// Record what a pairwise session's key fingerprint is, for link probes.
+    pub fn group_set_link_fingerprint(&self, session_id: &str, fingerprint: &str) -> Result<(), String> {
+        let mut map = self.groups.lock().map_err(|_| "groups lock poisoned".to_string())?;
+        for session in map.values_mut() {
+            session.set_link_fingerprint(session_id, fingerprint);
+        }
+        Ok(())
     }
 
     // ---- WebRTC methods ----

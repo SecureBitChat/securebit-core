@@ -44,7 +44,27 @@ a reviewer where to look, and where there is nothing to find.
 | Messages | AES-256-GCM payload, separately encrypted metadata, HMAC-SHA-256 over the canonical payload |
 | Verification | Short authentication string derived from the shared secret and both DTLS fingerprints |
 | Files and voice notes | Per-file key derivation, per-chunk AES-256-GCM, SHA-256 integrity over the whole file |
+| Group chats | Per-group ECDSA P-384 identity keys, signed membership operations and messages, signed mesh descriptors and link probes, a commit-then-reveal group safety code, and the state machine that runs all of it |
 | Sessions | Several independent, fully isolated sessions in one process |
+
+The group state machine is **sans-IO**: it owns no transport, no timers and no
+runtime. Every call returns a list of actions the platform performs — put this
+frame on that session, dial that member, arm that timer — and the platform
+reports back through the same door. A desktop drives it from a webview, a phone
+from native WebRTC, a test from a `Vec`.
+
+A group has **no shared group key**. Every message travels over the pairwise
+session it is sent on — its own ratchet, its own AES-256-GCM key — and carries a
+signature from the sender's per-group identity key, so a member who relays a
+frame for a pair that cannot reach each other can read it (they are in the
+group) but cannot forge one, alter one, or attribute it to somebody else.
+Removing a member therefore does not require rotating a key: it opens a new
+epoch, which every remaining member must confirm with a new safety code.
+
+Why the group code is commit-then-reveal rather than a hash of the member set is
+argued at the top of [`src/group_crypto.rs`](src/group_crypto.rs); the short
+version is that hashing the set makes the code a birthday target for a member
+who introduces two others, and seven digits do not survive that.
 
 ### Deliberately not in this crate
 
@@ -70,6 +90,8 @@ a reviewer where to look, and where there is nothing to find.
 | [`src/session.rs`](src/session.rs) | ~490 lines | Message encryption and decryption, metadata protection, MAC, chat frame selection |
 | [`src/core.rs`](src/core.rs) | ~440 lines | Public API surface and session isolation |
 | [`src/crypto.rs`](src/crypto.rs) | ~330 lines | Key-pair generation, generic encrypt/decrypt helpers, measured security level |
+| [`src/group_session.rs`](src/group_session.rs) | ~1250 lines | The group state machine: roster adoption, the commit/reveal round, relay routing, the mesh dialling rule, link probes, membership changes |
+| [`src/group_crypto.rs`](src/group_crypto.rs) | ~900 lines | Group identity keys, the canonical length-prefixed encoding every group signature covers, membership and message signatures, mesh-descriptor and link-probe signatures, the commit-reveal ceremony |
 | [`src/file_crypto.rs`](src/file_crypto.rs) | ~110 lines | Key fingerprint and per-file key derivation, chunk encryption |
 
 State lives in three places, all behind `Arc<Mutex<_>>` and none of it persisted:
@@ -91,6 +113,8 @@ verification code, and the ratchet state when a session runs one).
 | Per-message keys | Double Ratchet (Signal design): HKDF-SHA-256 root steps, HMAC-SHA-256 chain steps, a fresh AES-256-GCM key and nonce for every message |
 | File chunks | AES-256-GCM, fresh nonce per chunk, SHA-256 over the whole file |
 | MITM detection | 7-digit SAS from HKDF over the shared secret and both DTLS fingerprints |
+| Group membership and messages | ECDSA P-384 with SHA-384 over a length-prefixed canonical encoding; a per-group identity key, separate from the per-connection one |
+| Group MITM detection | 7-digit SAS from HKDF-SHA-256 over every member's key fingerprint and every member's nonce, published commit-then-reveal |
 
 Forward secrecy works on two levels. The ephemeral ECDH key pair exists only
 for the lifetime of a session and is never persisted, so compromising the
