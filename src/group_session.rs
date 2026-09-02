@@ -55,7 +55,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use p384::ecdsa::VerifyingKey;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 fn bad(m: impl Into<String>) -> CoreError {
     CoreError::invalid_input(m.into())
@@ -84,12 +84,15 @@ pub mod frames {
     pub const MESH_ANSWER: &str = "g_manswer";
     pub const MESH_ABORT: &str = "g_mabort";
     pub const PROBE: &str = "g_probe";
+    /// Call control: who opened a call, who is in it, who has left. Media never
+    /// travels here — see the call section of `GroupSession`.
+    pub const CALL: &str = "g_call";
     /// The outer wrapper every group frame travels inside.
     pub const ENVELOPE: &str = "g_env";
 
-    pub const ALL: [&str; 13] = [
+    pub const ALL: [&str; 14] = [
         INVITE, HELLO, MEMBER, ROSTER, COMMIT, REVEAL, MESSAGE, RELAY, LEAVE,
-        MESH_OFFER, MESH_ANSWER, MESH_ABORT, PROBE,
+        MESH_OFFER, MESH_ANSWER, MESH_ABORT, PROBE, CALL,
     ];
 }
 
@@ -294,7 +297,55 @@ pub enum Event {
     /// A member sent two different bodies under one sequence number. Both
     /// signatures are valid, so this is provable rather than suspected.
     Inconsistency { fp: String, name: String, seq: u64 },
+    /// The group's call changed, or ended. `None` means there is no call.
+    ///
+    /// One event for the whole roster rather than join/leave deltas: the media
+    /// layer has to reconcile its legs against the full set anyway, and a delta
+    /// stream would let a dropped event leave a tile on screen for somebody who
+    /// hung up ten minutes ago.
+    Call(Option<CallSnapshot>),
     Error(String),
+}
+
+/// One member's place in a call, as the interface draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallParticipant {
+    pub fp: String,
+    pub name: String,
+    pub is_self: bool,
+    /// The pairwise session this member's media leg would ride, if there is one.
+    /// `None` means the mesh has not built a direct link yet — the person is in
+    /// the call and is shown as connecting, rather than being invisible.
+    pub session_id: Option<String>,
+    pub state: MemberState,
+}
+
+/// The call a group is holding, in the shape the interface renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSnapshot {
+    pub call_id: String,
+    pub started_by: String,
+    pub started_by_name: String,
+    pub with_video: bool,
+    pub started_at: i64,
+    /// Whether WE are in it. A call can be running with three people in it while
+    /// this device is merely being told about it; only joining changes this.
+    pub joined: bool,
+    pub participants: Vec<CallParticipant>,
+}
+
+/// The call this group is currently holding.
+#[derive(Debug, Clone)]
+struct CallState {
+    call_id: String,
+    started_by: String,
+    with_video: bool,
+    started_at: i64,
+    /// Ordered, so every device that renders the same call renders it in the
+    /// same order — a tile grid that reshuffles per member is a bug people
+    /// report as "the video jumped".
+    participants: BTreeSet<String>,
+    joined: bool,
 }
 
 /// Who a broadcast could not reach, and how many it did.
@@ -407,6 +458,14 @@ pub struct GroupSession {
     mesh_sessions: HashSet<String>,
     /// Sessions a probe has already been sent on, so it is sent once.
     probed: HashSet<String>,
+
+    /// The call this group is holding, or `None`.
+    call: Option<CallState>,
+    /// Our own counter over call frames. Monotonic; never reset within an epoch.
+    call_seq: u64,
+    /// fp -> highest call sequence seen, so a captured frame cannot be replayed.
+    call_seen: HashMap<String, u64>,
+
     destroyed: bool,
 }
 
@@ -439,6 +498,9 @@ impl GroupSession {
             failures: HashMap::new(),
             mesh_sessions: HashSet::new(),
             probed: HashSet::new(),
+            call: None,
+            call_seq: 0,
+            call_seen: HashMap::new(),
             destroyed: false,
         };
         let fp = session.identity.fingerprint.clone();
@@ -500,6 +562,27 @@ impl GroupSession {
 
     fn members_event(&self) -> Action {
         Action::Emit(Event::Members { members: self.members_snapshot(), epoch: self.epoch })
+    }
+
+    /// The member list changed; anyone no longer in the group leaves the call.
+    ///
+    /// Membership can change under a call — the admin removes somebody, a roster
+    /// for a new epoch arrives — and a call roster that outlived it would show a
+    /// person in the call who is not in the group, which is exactly the state
+    /// nobody could explain. Emitted separately from the member list because the
+    /// media layer listens for calls and not for membership.
+    fn prune_call(&mut self, out: &mut Vec<Action>) {
+        let Some(call) = self.call.as_mut() else { return };
+        let before = call.participants.len();
+        let members: BTreeSet<String> = self.members.keys().cloned().collect();
+        call.participants.retain(|fp| members.contains(fp));
+        let changed = call.participants.len() != before;
+        if call.participants.is_empty() {
+            self.call = None;
+        }
+        if changed || self.call.is_none() {
+            out.push(Action::Emit(Event::Call(self.call_snapshot())));
+        }
     }
 
     fn set_phase(&mut self, phase: GroupPhase, out: &mut Vec<Action>) {
@@ -1392,6 +1475,7 @@ impl GroupSession {
 
         out.push(Action::Emit(Event::Roster { name: self.name.clone(), epoch: self.epoch, admin_fp }));
         out.push(self.members_event());
+        self.prune_call(out);
         self.start_ceremony(out)
     }
 
@@ -1646,6 +1730,334 @@ impl GroupSession {
     }
 
     // -----------------------------------------------------------------------
+    // calls
+    // -----------------------------------------------------------------------
+    //
+    // WHAT TRAVELS HERE, AND WHAT DOES NOT
+    // ------------------------------------
+    // Only the roster of a call: somebody opened one, somebody joined it,
+    // somebody left. No audio, no video, no SDP. The media is N-1 ordinary 1:1
+    // calls, one to each other member over the link they already share, so a
+    // group call is N-1 of the calls this app already makes, on transports a
+    // human already authenticated. There is no mixer and no server, and no
+    // moment at which anyone but the two ends of a leg holds its keys.
+    //
+    // That is why call control is separate from the media path. Control has to
+    // reach members this device may have no direct link to, and it reaches them
+    // the same way a group message does — signed, and relayed if need be. A
+    // member with no direct link still SEES the call and can be dialled into it
+    // once the mesh builds one, rather than silently missing it.
+    //
+    // WHY EVERY FRAME IS SIGNED
+    // -------------------------
+    // A relaying member carries call control for pairs that cannot reach each
+    // other. Unsigned, that member could add somebody to a call they never
+    // joined, or drop somebody who is in one, and nobody could tell it had
+    // happened. Signed with the group identity key, a relay can still refuse to
+    // carry a frame — the same availability cost relaying always has — but it
+    // cannot write one.
+
+    /// What the app renders. `None` when there is no call.
+    pub fn call_snapshot(&self) -> Option<CallSnapshot> {
+        let call = self.call.as_ref()?;
+        let started_by_name = if call.started_by == self.self_fp() {
+            "You".to_string()
+        } else {
+            self.members
+                .get(&call.started_by)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| "A member".into())
+        };
+        Some(CallSnapshot {
+            call_id: call.call_id.clone(),
+            started_by: call.started_by.clone(),
+            started_by_name,
+            with_video: call.with_video,
+            started_at: call.started_at,
+            joined: call.joined,
+            participants: call
+                .participants
+                .iter()
+                .map(|fp| {
+                    let member = self.members.get(fp);
+                    CallParticipant {
+                        fp: fp.clone(),
+                        name: if *fp == self.self_fp() {
+                            "You".to_string()
+                        } else {
+                            member.map(|m| m.name.clone()).unwrap_or_else(|| "A member".into())
+                        },
+                        is_self: *fp == self.self_fp(),
+                        session_id: member.and_then(|m| m.session_id.clone()),
+                        state: member.map(|m| m.state).unwrap_or(MemberState::Lost),
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    fn emit_call(&self, out: &mut Vec<Action>) {
+        out.push(Action::Emit(Event::Call(self.call_snapshot())));
+    }
+
+    fn require_ready(&self) -> Result<(), CoreError> {
+        if self.phase != GroupPhase::Ready || !self.sas_confirmed {
+            return Err(bad("the group code has not been confirmed"));
+        }
+        Ok(())
+    }
+
+    /// Sign and fan out one call-control frame.
+    fn send_call_frame(
+        &mut self,
+        action: gc::CallAction,
+        call_id: &str,
+        with_video: bool,
+        out: &mut Vec<Action>,
+    ) -> Result<DeliveryReport, CoreError> {
+        self.call_seq += 1;
+        let seq = self.call_seq;
+        let sig = gc::sign_group_call(
+            &self.identity,
+            &self.group_id,
+            self.epoch,
+            call_id,
+            action,
+            self.self_fp(),
+            seq,
+            with_video,
+        )?;
+        let frame = json!({
+            "type": frames::CALL, "gid": self.group_id, "epoch": self.epoch,
+            "callId": call_id, "action": action.as_str(), "fp": self.self_fp(),
+            "seq": seq, "v": with_video, "ts": now_ms(), "sig": B64.encode(&sig),
+        });
+        self.broadcast(&frame, out)
+    }
+
+    /// Open a call and put ourselves in it.
+    ///
+    /// Refused while one is already running: joining the call that exists is
+    /// what the user means, and a second concurrent call would split the group
+    /// into two rooms that cannot hear each other.
+    ///
+    /// The microphone is opened by the platform BEFORE this is called, and the
+    /// call is announced only once it has one. Announcing first would ring
+    /// everybody else's device for a call this one turns out not to be able to
+    /// make — a denied permission, no microphone, another application holding
+    /// it — and failing before the frame goes out costs nobody but the person
+    /// who pressed the button.
+    pub fn start_call(
+        &mut self,
+        with_video: bool,
+    ) -> Result<(Vec<Action>, DeliveryReport, String), CoreError> {
+        self.require_ready()?;
+        if self.call.is_some() {
+            return Err(bad("a call is already running in this group"));
+        }
+        let call_id = gc::new_call_id();
+        self.call = Some(CallState {
+            call_id: call_id.clone(),
+            started_by: self.self_fp().to_string(),
+            with_video,
+            started_at: now_ms(),
+            participants: BTreeSet::from([self.self_fp().to_string()]),
+            joined: true,
+        });
+        let mut out = Vec::new();
+        self.emit_call(&mut out);
+        // Media needs a direct link, so a call is the moment it is most worth
+        // having one. The mesh would get there on its own; this stops the first
+        // seconds of the call being spent waiting for a maintenance pass.
+        self.mesh_maintain(&mut out);
+        let report = match self.send_call_frame(gc::CallAction::Start, &call_id, with_video, &mut out) {
+            Ok(report) => report,
+            Err(error) => {
+                // The group was never told, so there is no call: the caller sees
+                // the error and the state it rolled back to is the one every
+                // other member is already in.
+                self.call = None;
+                return Err(error);
+            }
+        };
+        Ok((out, report, call_id))
+    }
+
+    /// Join the call that is already running.
+    pub fn join_call(&mut self) -> Result<(Vec<Action>, DeliveryReport, String), CoreError> {
+        self.require_ready()?;
+        let Some(call) = self.call.as_mut() else {
+            return Err(bad("there is no call to join"));
+        };
+        let call_id = call.call_id.clone();
+        let with_video = call.with_video;
+        if call.joined {
+            return Ok((Vec::new(), DeliveryReport::default(), call_id));
+        }
+        call.joined = true;
+        let me = self.identity.fingerprint.clone();
+        if let Some(call) = self.call.as_mut() {
+            call.participants.insert(me);
+        }
+        let mut out = Vec::new();
+        self.emit_call(&mut out);
+        self.mesh_maintain(&mut out);
+        let report = self.send_call_frame(gc::CallAction::Join, &call_id, with_video, &mut out)?;
+        Ok((out, report, call_id))
+    }
+
+    /// Leave the call.
+    ///
+    /// Leaving is always local first: the frame is best effort, because a member
+    /// who cannot be reached must not be able to keep us in a call by being
+    /// unreachable.
+    pub fn leave_call(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        let Some(call) = self.call.as_mut() else { return out };
+        let call_id = call.call_id.clone();
+        let with_video = call.with_video;
+        let me = self.identity.fingerprint.clone();
+        call.joined = false;
+        call.participants.remove(&me);
+        if call.participants.is_empty() {
+            self.call = None;
+        }
+        self.emit_call(&mut out);
+        // Best effort: an error here means the group was not told, which is a
+        // stale tile on somebody else's screen — never a reason to stay in.
+        let _ = self.send_call_frame(gc::CallAction::Leave, &call_id, with_video, &mut out);
+        out
+    }
+
+    /// A member is gone (left the call, left the group, or was removed).
+    ///
+    /// A call with NOBODY in it is over. A call with only us in it is not: that
+    /// is exactly the state every call is in for the seconds between opening it
+    /// and the first person joining, and ending it there would hang up on
+    /// somebody who is on their way in. Leaving is the user's decision, and
+    /// `leave_call` is the only thing that makes it.
+    fn drop_from_call(&mut self, fp: &str, out: &mut Vec<Action>) {
+        let Some(call) = self.call.as_mut() else { return };
+        if !call.participants.remove(fp) {
+            return;
+        }
+        if call.participants.is_empty() {
+            self.call = None;
+        }
+        self.emit_call(out);
+    }
+
+    fn on_call(&mut self, frame: &Value, out: &mut Vec<Action>) -> Result<(), CoreError> {
+        let epoch = field_epoch(frame, "epoch")?;
+        let seq = field_epoch(frame, "seq")?;
+        let sender_fp = field_fingerprint(frame, "fp")?;
+        let call_id = frame.get("callId").and_then(|c| c.as_str()).unwrap_or("");
+        gc::assert_call_id(call_id)?;
+        let action = gc::CallAction::parse(frame.get("action").and_then(|a| a.as_str()).unwrap_or(""))?;
+        let with_video = frame.get("v").and_then(|v| v.as_bool()) == Some(true);
+
+        if sender_fp == self.self_fp() {
+            return Ok(()); // our own frame came back around
+        }
+        let key = match self.members.get(&sender_fp) {
+            Some(m) => match m.key {
+                Some(k) => k,
+                None => return Err(bad("call frame from a non-member")),
+            },
+            None => return Err(bad("call frame from a non-member")),
+        };
+        if epoch != self.epoch {
+            return Err(bad("call frame from another epoch"));
+        }
+
+        // Replay window first, so a captured frame is dropped before its action
+        // is considered at all. Equal counts as a replay: a sender never reuses
+        // a sequence number, and fan-out duplicates of the same frame are
+        // exactly what this absorbs.
+        if let Some(seen) = self.call_seen.get(&sender_fp) {
+            if seq <= *seen {
+                return Ok(());
+            }
+        }
+        let sig = decode_b64(frame, "sig", gc::MAX_SIG_BYTES)?;
+        if !gc::verify_group_call(
+            &key, &self.group_id, epoch, call_id, action, &sender_fp, seq, with_video, &sig,
+        ) {
+            return Err(bad("call frame signature did not verify"));
+        }
+        self.call_seen.insert(sender_fp.clone(), seq);
+
+        // Nothing about a call may be acted on before the group itself is
+        // usable: a call that arrives mid-ceremony would be a ringing phone for
+        // a group nobody has authenticated yet.
+        if self.phase != GroupPhase::Ready || !self.sas_confirmed {
+            return Ok(());
+        }
+
+        match action {
+            gc::CallAction::Start => {
+                if let Some(existing) = self.call.as_ref() {
+                    if existing.call_id != call_id {
+                        // Two calls opened at once. The lower id wins for
+                        // everyone, because every member compares the same two
+                        // values and gets the same answer — so the group
+                        // converges on one room instead of splitting into two
+                        // that cannot hear each other.
+                        if call_id >= existing.call_id.as_str() {
+                            return Ok(());
+                        }
+                        // We are being moved off a call we may be in. Say so, so
+                        // the media layer tears the old one down before building
+                        // the new one.
+                        self.call = None;
+                    }
+                }
+                match self.call.as_mut() {
+                    Some(call) => {
+                        call.participants.insert(sender_fp);
+                    }
+                    None => {
+                        self.call = Some(CallState {
+                            call_id: call_id.to_string(),
+                            started_by: sender_fp.clone(),
+                            with_video,
+                            started_at: now_ms(),
+                            participants: BTreeSet::from([sender_fp]),
+                            joined: false,
+                        });
+                    }
+                }
+                self.emit_call(out);
+                self.mesh_maintain(out);
+                Ok(())
+            }
+            gc::CallAction::Join => {
+                let Some(call) = self.call.as_mut() else { return Ok(()) };
+                if call.call_id != call_id || call.participants.contains(&sender_fp) {
+                    return Ok(());
+                }
+                call.participants.insert(sender_fp);
+                // A member joining with video turns the call into one that has
+                // video in it; nobody's own camera is turned on by this.
+                if with_video {
+                    call.with_video = true;
+                }
+                self.emit_call(out);
+                self.mesh_maintain(out);
+                Ok(())
+            }
+            gc::CallAction::Leave => {
+                match self.call.as_ref() {
+                    Some(call) if call.call_id == call_id => {}
+                    _ => return Ok(()),
+                }
+                self.drop_from_call(&sender_fp, out);
+                Ok(())
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // inbound dispatch
     // -----------------------------------------------------------------------
 
@@ -1687,6 +2099,7 @@ impl GroupSession {
             frames::MESH_OFFER => self.on_mesh_offer(&frame, &mut out)?,
             frames::MESH_ANSWER => self.on_mesh_answer(&frame, &mut out)?,
             frames::MESH_ABORT => self.on_mesh_abort(&frame, &mut out)?,
+            frames::CALL => self.on_call(&frame, &mut out)?,
             // A probe is a claim about the link it arrived on, so it is only
             // meaningful on a direct one. Relayed, it says nothing.
             frames::PROBE => {
@@ -1744,6 +2157,7 @@ impl GroupSession {
             _ => return Ok(()),
         };
         out.push(Action::Emit(Event::Left { fp: fp.clone(), name }));
+        self.drop_from_call(&fp, out);
 
         // The admin leaving ends the group for everyone else. Nobody else can
         // sign a roster, so there is no next epoch and no safety code to compare
@@ -1883,6 +2297,7 @@ impl GroupSession {
         self.session_to_fp.retain(|_, f| f != fp);
         self.epoch += 1;
         out.push(self.members_event());
+        self.prune_call(&mut out);
         self.publish_roster(MemberOp::Remove, &mut out)?;
         Ok(out)
     }
@@ -1940,6 +2355,8 @@ impl GroupSession {
         self.dials.clear();
         self.failures.clear();
         self.probed.clear();
+        self.call = None;
+        self.call_seen.clear();
         out
     }
 }
@@ -2020,6 +2437,32 @@ impl MemberSnapshot {
     }
 }
 
+impl CallParticipant {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "fp": self.fp,
+            "name": self.name,
+            "self": self.is_self,
+            "sessionId": self.session_id,
+            "state": self.state.as_str(),
+        })
+    }
+}
+
+impl CallSnapshot {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "callId": self.call_id,
+            "startedBy": self.started_by,
+            "startedByName": self.started_by_name,
+            "withVideo": self.with_video,
+            "startedAt": self.started_at,
+            "joined": self.joined,
+            "participants": self.participants.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
+        })
+    }
+}
+
 impl Event {
     pub fn to_json(&self) -> Value {
         match self {
@@ -2043,6 +2486,10 @@ impl Event {
             Event::AddFailed(reason) => json!({ "event": "addFailed", "reason": reason }),
             Event::Inconsistency { fp, name, seq } => json!({
                 "event": "inconsistency", "fp": fp, "name": name, "seq": seq,
+            }),
+            Event::Call(call) => json!({
+                "event": "call",
+                "call": call.as_ref().map(|c| c.to_json()),
             }),
             Event::Error(code) => json!({ "event": "error", "code": code }),
         }
@@ -2101,6 +2548,7 @@ impl GroupSession {
             "selfFp": self.self_fp(),
             "adminFp": self.admin_fp,
             "members": self.members_snapshot().iter().map(|m| m.to_json()).collect::<Vec<_>>(),
+            "call": self.call_snapshot().map(|c| c.to_json()),
         })
     }
 }

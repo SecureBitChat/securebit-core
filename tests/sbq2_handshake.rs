@@ -270,3 +270,55 @@ fn roles_must_be_opposite() {
     assert_eq!(blob.role, Role::Answer);
     assert_eq!(Role::Answer.peer(), Role::Offer);
 }
+
+// ---------------------------------------------------------------------------
+// what a disconnect leaves behind
+// ---------------------------------------------------------------------------
+//
+// `disconnect_session` keeps the session in the registry on purpose, so the tab
+// can be used for a fresh handshake. That promise is only kept if the previous
+// handshake is actually gone: `Sbq2State`'s presence is the latch that fixes the
+// format for a connection, and it carries our identity signing key, the peer's
+// keys and the transcript both sides signed.
+//
+// Left behind, it did two things at once — told the next exchange it was already
+// underway, and kept key material past the point this code exists to wipe it.
+// The visible symptom was a reconnection whose safety code never appeared.
+
+#[test]
+fn disconnecting_wipes_the_handshake_it_belonged_to() {
+    use securebit_core::Core;
+
+    let core = Core::new();
+    core.create_session("tab-1").expect("create session");
+
+    // A real handshake, up to the point where the session holds everything.
+    let invitation = core
+        .create_secure_offer(Some("tab-1"), Some(offer_sdp()))
+        .expect("create offer");
+    assert!(invitation.starts_with("SB2:"));
+    assert!(core.sbq2_is_active(Some("tab-1")), "the session is mid-SBQ2 handshake");
+
+    core.disconnect_session(Some("tab-1")).expect("disconnect");
+
+    assert!(
+        !core.sbq2_is_active(Some("tab-1")),
+        "the handshake state must not outlive the connection: left in place it latches \
+         the next handshake on this session to a peer and a commitment that are gone"
+    );
+
+    // And the session is still there to be reused — that is the whole point of
+    // disconnecting rather than closing.
+    assert!(
+        core.list_sessions().iter().any(|s| s == "tab-1"),
+        "disconnect keeps the session so the tab can start a fresh handshake"
+    );
+
+    // A fresh handshake on the same session starts from nothing and gets there.
+    let again = core
+        .create_secure_offer(Some("tab-1"), Some(offer_sdp()))
+        .expect("a second invitation on the same session");
+    assert!(again.starts_with("SB2:"));
+    assert_ne!(again, invitation, "the second invitation must not repeat the first");
+    assert!(core.sbq2_is_active(Some("tab-1")));
+}

@@ -652,6 +652,231 @@ fn a_group_cannot_be_emptied_by_removal() {
     assert_eq!(net.session(0).member_count(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// 7. calls
+// ---------------------------------------------------------------------------
+//
+// A group call is N-1 pairwise calls; what the session owns is only the roster
+// of who is in it. These check the part that travels: that it reaches a member
+// with no direct link, that it is signed, and that a captured frame is useless.
+
+/// A confirmed star: everyone has compared the code, nobody has dialled yet.
+fn confirmed_star() -> Net {
+    let mut net = star_group();
+    for node in 0..3 {
+        let out = net.session(node).confirm_sas().unwrap();
+        let filtered: Vec<Action> =
+            out.into_iter().filter(|a| !matches!(a, Action::Dial { .. })).collect();
+        net.run(node, filtered);
+    }
+    net
+}
+
+/// The call a node currently believes in, from the events it was given — which
+/// is the only way the app learns about one.
+fn last_call(net: &Net, node: usize) -> Option<securebit_core::group_session::CallSnapshot> {
+    net.events(node)
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::Call(call) => Some(call.clone()),
+            _ => None,
+        })
+        .flatten()
+}
+
+fn in_call(call: &securebit_core::group_session::CallSnapshot) -> Vec<String> {
+    let mut fps: Vec<String> = call.participants.iter().map(|p| p.fp.clone()).collect();
+    fps.sort();
+    fps
+}
+
+#[test]
+fn a_call_reaches_every_member_including_the_one_with_no_direct_link() {
+    let mut net = confirmed_star();
+    let alice_fp = net.session(0).self_fp().to_string();
+    let bob_fp = net.session(1).self_fp().to_string();
+
+    // Carol has no link to Bob: her copy of the call must arrive over the relay
+    // that Alice already carries for them, or a member without a direct link
+    // would simply never learn a call was happening.
+    let (out, report, call_id) = net.session(0).start_call(false).unwrap();
+    net.run(0, out);
+    assert_eq!(report.unreachable.len(), 0, "both members are reachable from the admin");
+
+    for node in 0..3 {
+        let call = last_call(&net, node).unwrap_or_else(|| panic!("node {} never heard about the call", node));
+        assert_eq!(call.call_id, call_id);
+        assert_eq!(call.started_by, alice_fp);
+        assert!(!call.with_video);
+        assert_eq!(in_call(&call), vec![alice_fp.clone()]);
+        // Only the person who opened it is in it.
+        assert_eq!(call.joined, node == 0, "node {} joined state", node);
+    }
+
+    // Bob joins; everyone converges on the same two-person roster.
+    let (out, _, joined_id) = net.session(1).join_call().unwrap();
+    net.run(1, out);
+    assert_eq!(joined_id, call_id);
+    let mut expected = vec![alice_fp.clone(), bob_fp.clone()];
+    expected.sort();
+    for node in 0..3 {
+        let call = last_call(&net, node).unwrap();
+        assert_eq!(in_call(&call), expected, "node {} roster", node);
+    }
+    assert!(last_call(&net, 1).unwrap().joined);
+    assert!(!last_call(&net, 2).unwrap().joined, "carol was told, not joined");
+
+    // Bob leaves. The call is still running, because Alice is still in it.
+    let out = net.session(1).leave_call();
+    net.run(1, out);
+    for node in 0..3 {
+        let call = last_call(&net, node).unwrap_or_else(|| panic!("node {} lost the call entirely", node));
+        assert_eq!(in_call(&call), vec![alice_fp.clone()], "node {} after bob left", node);
+    }
+
+    // Alice leaves too: nobody is left, so there is no call anywhere.
+    let out = net.session(0).leave_call();
+    net.run(0, out);
+    for node in 0..3 {
+        assert!(
+            last_call(&net, node).is_none(),
+            "node {} still shows a call nobody is in",
+            node
+        );
+    }
+}
+
+#[test]
+fn a_second_call_opened_at_the_same_moment_converges_on_one_room() {
+    let mut net = confirmed_star();
+
+    // Two calls, opened without either side having heard the other. Every member
+    // must end up in the SAME one or the group splits into two rooms that cannot
+    // hear each other — the lower call id wins, everywhere.
+    let (alice_out, _, alice_call) = net.session(0).start_call(false).unwrap();
+    let (bob_out, _, bob_call) = net.session(1).start_call(true).unwrap();
+    net.run(0, alice_out);
+    net.run(1, bob_out);
+
+    // Asserted against the SESSIONS, not against the events they emitted.
+    //
+    // Holding both sides' actions and running them afterwards is what makes this
+    // a collision at all — a real app runs them as it gets them — and the cost is
+    // that Bob's event list ends with the snapshot his own `start_call` made
+    // before Alice's frame reached him. That stale event is an artefact of the
+    // ordering this test forces; what the group actually believes is the state.
+    let winner = if alice_call < bob_call { alice_call } else { bob_call };
+    for node in 0..3 {
+        let call = net.session(node).call_snapshot().expect("every member is in a call");
+        assert_eq!(call.call_id, winner, "node {} settled on the wrong call", node);
+    }
+}
+
+#[test]
+fn a_call_frame_is_refused_when_forged_replayed_or_from_a_stranger() {
+    let mut net = confirmed_star();
+
+    // Capture a real, signed start frame on its way from Alice to Bob.
+    let (out, _, _) = net.session(0).start_call(false).unwrap();
+    let frame = call_frame(&out);
+    net.run(0, out);
+    let before = last_call(&net, 1).unwrap();
+
+    // The same frame again is fan-out, not news, and a REPLAY of it after the
+    // call ended must not resurrect one: the sequence number has been passed.
+    let again = net.session(1).handle_frame("B>A", &frame).unwrap();
+    assert!(
+        !again.iter().any(|a| matches!(a, Action::Emit(Event::Call(_)))),
+        "a replayed call frame must change nothing"
+    );
+    assert_eq!(in_call(&last_call(&net, 1).unwrap()), in_call(&before));
+
+    // A relay that rewrote the action — turning somebody's `start` into a
+    // `leave`, or an audio call into a video one — is what the signature exists
+    // to catch. The sequence number is bumped so the replay window is not what
+    // rejects it.
+    for (field, value) in [
+        ("action", Value::String("leave".into())),
+        ("v", Value::Bool(true)),
+    ] {
+        let mut forged = securebit_core::group_session::decode_envelope(&frame).unwrap();
+        forged["seq"] = Value::from(99u64);
+        forged[field] = value.clone();
+        let wrapped = securebit_core::group_session::encode_envelope(&forged).unwrap();
+        assert!(
+            net.session(1).handle_frame("B>A", &wrapped).is_err(),
+            "a call frame with a rewritten {} must be refused",
+            field
+        );
+    }
+
+    // A frame signed by a real key that is not a member of this group.
+    let mut stranger = securebit_core::group_session::decode_envelope(&frame).unwrap();
+    stranger["fp"] = Value::String("cc".repeat(32));
+    stranger["seq"] = Value::from(100u64);
+    let wrapped = securebit_core::group_session::encode_envelope(&stranger).unwrap();
+    assert!(
+        net.session(1).handle_frame("B>A", &wrapped).is_err(),
+        "a call frame from a non-member must be refused"
+    );
+}
+
+#[test]
+fn a_removed_member_is_dropped_from_the_call() {
+    let mut net = confirmed_star();
+    let alice_fp = net.session(0).self_fp().to_string();
+    let carol_fp = net.session(2).self_fp().to_string();
+
+    let (out, _, _) = net.session(0).start_call(false).unwrap();
+    net.run(0, out);
+    let (out, _, _) = net.session(2).join_call().unwrap();
+    net.run(2, out);
+    assert_eq!(last_call(&net, 0).unwrap().participants.len(), 2);
+
+    // Carol is removed from the group. Someone in a call but not in the group is
+    // a tile nobody can explain, so the call roster follows membership.
+    let out = net.session(0).remove_member(&carol_fp).unwrap();
+    net.run(0, out);
+    let call = last_call(&net, 0).expect("alice is still in her own call");
+    assert_eq!(in_call(&call), vec![alice_fp]);
+}
+
+#[test]
+fn a_call_cannot_be_opened_before_the_code_is_confirmed() {
+    let mut net = star_group();
+    assert!(
+        net.session(0).start_call(false).is_err(),
+        "a call before the safety code is a ringing phone for a group nobody authenticated"
+    );
+    assert!(net.session(0).join_call().is_err(), "there is nothing to join");
+
+    // And a second call while one is running is a join, not a new room.
+    let mut net = confirmed_star();
+    let (out, _, _) = net.session(0).start_call(false).unwrap();
+    net.run(0, out);
+    assert!(net.session(0).start_call(false).is_err());
+    assert!(net.session(1).start_call(false).is_err());
+}
+
+/// The direct call-control frame out of a start/join, unwrapped from the fan-out.
+fn call_frame(actions: &[Action]) -> Value {
+    actions
+        .iter()
+        .find_map(|a| match a {
+            Action::Send { frame, .. } => {
+                let inner = securebit_core::group_session::decode_envelope(frame).ok()?;
+                if inner.get("type")?.as_str()? == frames::CALL {
+                    Some(frame.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .expect("call control must go out directly to at least one member")
+}
+
 /// The DIRECT message frame out of a send, not the relay wrapper that carries
 /// the same message to a member who has no link of their own. Both are on the
 /// wire; only one of them is the frame under test here.

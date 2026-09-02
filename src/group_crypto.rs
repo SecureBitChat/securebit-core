@@ -101,6 +101,14 @@ pub const MAX_DESCRIPTOR_CHARS: usize = 768;
 /// Binds an answer to the one dial attempt that asked for it.
 pub const MESH_NONCE_BYTES: usize = 16;
 
+/// A group call's identifier, in bytes.
+///
+/// Random rather than derived, and long enough that two members who press
+/// "call" at the same instant cannot collide. Everything about a call is scoped
+/// to it: a `join` for one call says nothing about another, and a `leave`
+/// replayed from a finished call cannot end a later one.
+pub const CALL_ID_BYTES: usize = 16;
+
 /// A membership operation. The wire form is the lowercase word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberOp {
@@ -151,6 +159,42 @@ impl MeshKind {
             "moffer" => Ok(MeshKind::Offer),
             "manswer" => Ok(MeshKind::Answer),
             _ => Err(bad("unknown mesh descriptor kind")),
+        }
+    }
+}
+
+/// What one member is telling the group about a call.
+///
+/// There is deliberately no "end the call for everyone": a call ends when the
+/// last person in it leaves, which is a fact every member can observe from the
+/// frames they already have. An explicit end would be a button one member could
+/// press to hang up on the others, and nothing in a group without a server
+/// makes that person more entitled to it than anybody else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallAction {
+    /// I have opened a call and I am in it.
+    Start,
+    /// I am joining the call already open.
+    Join,
+    /// I have left; the call ends when nobody is left.
+    Leave,
+}
+
+impl CallAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallAction::Start => "start",
+            CallAction::Join => "join",
+            CallAction::Leave => "leave",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, CoreError> {
+        match value {
+            "start" => Ok(CallAction::Start),
+            "join" => Ok(CallAction::Join),
+            "leave" => Ok(CallAction::Leave),
+            _ => Err(bad("unknown call action")),
         }
     }
 }
@@ -943,6 +987,97 @@ pub fn verify_link_probe(
     }
 }
 
+pub fn assert_call_id(call_id: &str) -> Result<Vec<u8>, CoreError> {
+    if call_id.len() != CALL_ID_BYTES * 2 || !is_lower_hex(call_id) {
+        return Err(bad("malformed call id"));
+    }
+    hex::decode(call_id).map_err(|_| bad("malformed call id"))
+}
+
+/// The bytes a call-control frame is signed over.
+///
+/// Call control is membership-visible metadata, not content, but it is signed
+/// with the same group identity key for the same reason a message is: a
+/// relaying member carries these frames, and a relay that could forge one could
+/// put a member into a call they never joined, or take one out of a call they
+/// are in, with no way for anyone to tell who did it.
+///
+/// `seq` is a per-sender counter over call frames only. It is what makes a
+/// captured frame unusable later: a `leave` from a finished call replays with a
+/// sequence number the receiver has already passed, and is dropped before its
+/// action is ever considered.
+pub fn group_call_payload(
+    group_id: &str,
+    epoch: u64,
+    call_id: &str,
+    action: CallAction,
+    fp: &str,
+    seq: u64,
+    with_video: bool,
+) -> Result<Vec<u8>, CoreError> {
+    let gid = assert_group_id(group_id)?;
+    let epoch_be = u32_be(assert_epoch(epoch)?)?;
+    let cid = assert_call_id(call_id)?;
+    let sender = assert_fingerprint(fp)?;
+    let seq_be = u32_be(assert_epoch(seq)?)?;
+    Ok(lp(
+        "securebit/group/call/v1",
+        &[
+            Part::Bytes(&gid),
+            Part::Bytes(&epoch_be),
+            Part::Bytes(&cid),
+            Part::Text(action.as_str()),
+            Part::Bytes(&sender),
+            Part::Bytes(&seq_be),
+            // One byte of intent, not a boolean field: the audio and the video
+            // form of the same call must not sign the same bytes, or a captured
+            // audio `start` could be replayed as a video one.
+            Part::Text(if with_video { "v" } else { "a" }),
+        ],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sign_group_call(
+    identity: &GroupIdentity,
+    group_id: &str,
+    epoch: u64,
+    call_id: &str,
+    action: CallAction,
+    fp: &str,
+    seq: u64,
+    with_video: bool,
+) -> Result<Vec<u8>, CoreError> {
+    identity.sign(&group_call_payload(
+        group_id, epoch, call_id, action, fp, seq, with_video,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_group_call(
+    key: &VerifyingKey,
+    group_id: &str,
+    epoch: u64,
+    call_id: &str,
+    action: CallAction,
+    fp: &str,
+    seq: u64,
+    with_video: bool,
+    signature: &[u8],
+) -> bool {
+    match group_call_payload(group_id, epoch, call_id, action, fp, seq, with_video) {
+        Ok(payload) => verify_with(key, &payload, signature),
+        Err(_) => false,
+    }
+}
+
+/// A fresh call id. Scopes every frame about one call to that call.
+pub fn new_call_id() -> String {
+    let mut bytes = [0u8; CALL_ID_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// A fresh group id. Shared between members, unlike a local session id.
 pub fn new_group_id() -> String {
     let mut bytes = [0u8; GROUP_ID_BYTES];
@@ -1008,6 +1143,76 @@ mod tests {
 
         let answer = mesh_descriptor_payload(GID, EPOCH, MeshKind::Answer, FP_B, FP_A, "SB2:xyz", &nonce).unwrap();
         assert_eq!(hex::encode(answer), "7365637572656269742f67726f75702f6d6573682d64657363726970746f722f763100000000100f1e2d3c4b5a69788796a5b4c3d2e1f00000000400000007000000076d616e7377657200000020bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000075342323a78797a000000100102030405060708090a0b0c0d0e0f10");
+    }
+
+    /// Call control signs the same bytes in both builds, or a desktop member
+    /// opening a call is a forgery to every browser in the group. Both vectors
+    /// come from `groupCallPayload` in the web client's own groupCrypto.js.
+    #[test]
+    fn call_payload_matches_web_reference() {
+        const CID: &str = "0102030405060708090a0b0c0d0e0f10";
+
+        let start = group_call_payload(GID, EPOCH, CID, CallAction::Start, FP_A, 3, true).unwrap();
+        assert_eq!(hex::encode(start), "7365637572656269742f67726f75702f63616c6c2f763100000000100f1e2d3c4b5a69788796a5b4c3d2e1f00000000400000007000000100102030405060708090a0b0c0d0e0f1000000005737461727400000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00000004000000030000000176");
+
+        let leave = group_call_payload(GID, EPOCH, CID, CallAction::Leave, FP_A, 9, false).unwrap();
+        assert_eq!(hex::encode(leave), "7365637572656269742f67726f75702f63616c6c2f763100000000100f1e2d3c4b5a69788796a5b4c3d2e1f00000000400000007000000100102030405060708090a0b0c0d0e0f10000000056c6561766500000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00000004000000090000000161");
+
+        // The audio and the video form of one call must not sign the same bytes,
+        // or a captured audio start replays as a video one and opens a camera.
+        assert_ne!(
+            group_call_payload(GID, EPOCH, CID, CallAction::Start, FP_A, 3, true).unwrap(),
+            group_call_payload(GID, EPOCH, CID, CallAction::Start, FP_A, 3, false).unwrap()
+        );
+    }
+
+    /// A call frame the BROWSER signed, verified here.
+    ///
+    /// The payload vector above says the two builds hash the same bytes; this
+    /// says the whole signature crosses. Made by WebCrypto in the web client's
+    /// `signGroupCall` over the same fields, with the key above.
+    #[test]
+    fn a_call_frame_signed_by_the_web_client_verifies_here() {
+        const CID: &str = "0102030405060708090a0b0c0d0e0f10";
+        const JS_SIG_HEX: &str = "689ee9ca350c9f2e6f2be2c663d2e6f157a994a0f2cfeb7d9779aff665f9a40ab4f3d4cb17646a96c9022bef80f4e81032aa744b1c1f5b0696dbe43b8e31244065da41bd3c478acbb742a2678ad04e9510479154a4a5d472abad84a907234282";
+        let (key, fp) = import_member_identity(&hex::decode(SPKI_HEX).unwrap()).unwrap();
+        assert_eq!(fp, SPKI_FINGERPRINT);
+        let sig = hex::decode(JS_SIG_HEX).unwrap();
+        assert!(verify_group_call(
+            &key, GID, EPOCH, CID, CallAction::Start, FP_A, 3, true, &sig
+        ));
+        // And it is genuinely bound to what it says: the same signature over a
+        // call that is not this one does not verify.
+        assert!(!verify_group_call(
+            &key, GID, EPOCH, &"11".repeat(16), CallAction::Start, FP_A, 3, true, &sig
+        ));
+    }
+
+    #[test]
+    fn call_signature_round_trips_and_rejects_a_changed_field() {
+        const CID: &str = "0102030405060708090a0b0c0d0e0f10";
+        let identity = GroupIdentity::from_pkcs8_der(&hex::decode(PKCS8_HEX).unwrap()).unwrap();
+        let key = identity.verifying_key();
+        let sig =
+            sign_group_call(&identity, GID, EPOCH, CID, CallAction::Join, FP_A, 4, false).unwrap();
+
+        assert!(verify_group_call(&key, GID, EPOCH, CID, CallAction::Join, FP_A, 4, false, &sig));
+        // A relay that flipped the action, the call, the sequence or the media
+        // kind is what the signature exists to catch.
+        assert!(!verify_group_call(&key, GID, EPOCH, CID, CallAction::Leave, FP_A, 4, false, &sig));
+        assert!(!verify_group_call(&key, GID, EPOCH, CID, CallAction::Join, FP_A, 5, false, &sig));
+        assert!(!verify_group_call(&key, GID, EPOCH, CID, CallAction::Join, FP_A, 4, true, &sig));
+        assert!(!verify_group_call(&key, GID, EPOCH, CID, CallAction::Join, FP_B, 4, false, &sig));
+    }
+
+    #[test]
+    fn a_malformed_call_id_is_refused() {
+        assert!(assert_call_id("0102030405060708090a0b0c0d0e0f10").is_ok());
+        assert!(assert_call_id("0102030405060708090a0b0c0d0e0f").is_err());
+        assert!(assert_call_id("0102030405060708090A0B0C0D0E0F10").is_err());
+        assert!(assert_call_id("").is_err());
+        assert_eq!(new_call_id().len(), CALL_ID_BYTES * 2);
+        assert!(assert_call_id(&new_call_id()).is_ok());
     }
 
     #[test]

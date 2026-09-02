@@ -77,6 +77,36 @@ impl Session {
             state.ecdh_secret = None;
             state.session_salt = None;
             state.local_dtls_fingerprint = None;
+
+            // The SBQ2 handshake state goes with the connection it belonged to.
+            //
+            // Two reasons, and either one on its own would be enough. It holds
+            // key material this function exists to wipe: our identity signing
+            // key, the peer's public keys, and the transcript both sides signed.
+            // And its mere presence is the latch that fixes the format for a
+            // connection (see Sbq2State) — left behind, it tells the NEXT
+            // handshake on this session that it is already underway, with a
+            // commitment and a peer from a conversation that has ended. That is
+            // not a reuse this code could survive: `disconnect_session` keeps
+            // the session in the registry precisely so the tab can be used for a
+            // fresh handshake, and a fresh handshake starts from nothing.
+            if let Some(mut sbq2) = state.sbq2.take() {
+                for buffer in [
+                    &mut sbq2.local_blob,
+                    &mut sbq2.remote_blob,
+                    &mut sbq2.transcript,
+                    &mut sbq2.local_descriptor,
+                    &mut sbq2.remote_descriptor,
+                ] {
+                    if let Some(bytes) = buffer.as_mut() {
+                        for byte in bytes.iter_mut() {
+                            *byte = 0;
+                        }
+                    }
+                }
+                // The signing key and the peer's keys are zeroized by their own
+                // Drop as `sbq2` goes out of scope here.
+            }
         }
         if let Ok(mut keys) = self.session_keys.lock() {
             if let Some(ref mut k) = keys.encryption_key { for byte in k.iter_mut() { *byte = 0; } }
